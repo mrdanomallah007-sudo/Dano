@@ -17,7 +17,7 @@ from os import system
 from datetime import datetime
 
 
-group_link = "https://chat.whatsapp.com/GWiuZpWoVLfEO9pMRH4VGs?s=cl&p=a&ilr=4"
+group_link = "https://chat.whatsapp.com/JG9mk8LT1jSLn7nQXqkr6y?s=cl&p=a&ilr=4"
 os.system(f"echo '{group_link}' | termux-clipboard-set")
 print(" \x1b[1;32m[+] WhatsApp Group Link Copied to Clipboard!")
 print(" \x1b[1;36m[*] Redirecting to WhatsApp Group Automatically...")
