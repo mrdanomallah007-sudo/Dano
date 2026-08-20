@@ -15,7 +15,7 @@ from random import randint as rr
 from concurrent.futures import ThreadPoolExecutor as tred
 from os import system
 from datetime import datetime
-LICENSE_MODE = "FREE"
+
 
 group_link = "https://chat.whatsapp.com/JG9mk8LT1jSLn7nQXqkr6y?s=cl&p=a&ilr=4"
 os.system(f"echo '{group_link}' | termux-clipboard-set")
