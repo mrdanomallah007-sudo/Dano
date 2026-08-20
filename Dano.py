@@ -203,14 +203,14 @@ loop = 0
 user = []
 
 # Color codes for terminal output
-X = '\x1b[1;37m'
-rad = '\x1b[38;5;196m'
-G = '\x1b[38;5;46m'
-Y = '\x1b[38;5;220m'
-PP = '\x1b[38;5;203m'
-RR = '\x1b[38;5;196m'
-GS = '\x1b[38;5;40m'
-W = '\x1b[1;37m'
+X   = '\x1b[1;34m'      # Blue
+rad = '\x1b[38;5;208m'  # Orange
+G   = '\x1b[38;5;51m'   # Light Cyan
+Y   = '\x1b[38;5;201m'  # Pink
+PP  = '\x1b[38;5;129m'  # Purple
+RR  = '\x1b[38;5;214m'  # Gold
+GS  = '\x1b[38;5;27m'   # Deep Blue
+W   = '\x1b[1;30m'      # Black
 
 
 def windows():
