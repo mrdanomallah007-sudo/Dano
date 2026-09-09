@@ -109,6 +109,73 @@ class NgrokTunnel:
             cls.proc = None
         cls.url = cls.status = None
 
+
+# ─── Persistent Account Store ─────────────────────────────────────────────────
+DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_data.json")
+
+class AccountStore:
+    """Save / load / delete accounts from a JSON file on disk."""
+    _lock = threading.Lock()
+
+    @classmethod
+    def _load_raw(cls):
+        try:
+            with open(DATA_FILE,"r",encoding="utf-8") as f:
+                data = json.load(f)
+                return data if isinstance(data, list) else []
+        except: return []
+
+    @classmethod
+    def _save_raw(cls, data):
+        with open(DATA_FILE,"w",encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    @classmethod
+    def all(cls):
+        with cls._lock: return cls._load_raw()
+
+    @classmethod
+    def count(cls):
+        return len(cls.all())
+
+    @classmethod
+    def add_lines(cls, lines: list):
+        """Add new account lines (skip duplicates by email)."""
+        with cls._lock:
+            existing = cls._load_raw()
+            existing_emails = {r.get("email","").lower() for r in existing}
+            added = 0
+            for line in lines:
+                line = line.strip()
+                if not line: continue
+                acct = parse_account_line(line)
+                if not acct: continue
+                if acct["email"].lower() in existing_emails: continue
+                existing.append({
+                    "id":       hashlib.md5(line.encode()).hexdigest()[:10],
+                    "line":     line,
+                    "email":    acct["email"],
+                    "uid":      acct.get("uid",""),
+                    "added_at": __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M"),
+                })
+                existing_emails.add(acct["email"].lower())
+                added += 1
+            cls._save_raw(existing)
+            return added
+
+    @classmethod
+    def delete_by_id(cls, acc_id: str):
+        with cls._lock:
+            data = cls._load_raw()
+            new_data = [r for r in data if r.get("id") != acc_id]
+            cls._save_raw(new_data)
+            return len(data) - len(new_data)
+
+    @classmethod
+    def delete_all(cls):
+        with cls._lock:
+            cls._save_raw([])
+
 MSA_DOMAINS = {
     "hotmail.com","hotmail.co.uk","outlook.com","live.com",
     "live.co.uk","msn.com","windowslive.com","passport.com"
@@ -566,6 +633,7 @@ select{padding:9px 13px;background:#f9fafc;border:2px solid #dde1ea;border-radiu
     <span class="ver">V3.0</span>
     <button class="net-btn" onclick="toggleQR()" title="Same WiFi access">📱 WIFI</button>
     <button class="net-btn tunnel-btn" id="tunnelBtn" onclick="toggleTunnel()" title="Access from any network">🌐 PUBLIC URL</button>
+    <a href="/admin" class="net-btn" style="text-decoration:none;background:#fff8e6;border-color:#ffddaa;color:#cc8800" title="Admin Panel">🛡️ ADMIN</a>
     <a href="/logout" class="logout">LOGOUT</a>
   </div>
 </header>
@@ -670,6 +738,9 @@ select{padding:9px 13px;background:#f9fafc;border:2px solid #dde1ea;border-radiu
         <option value="100">Last 100 emails</option>
       </select>
       <button class="btn" id="enlistBtn" onclick="enlistAccounts()">📋 ENLIST ACCOUNTS</button>
+      <button class="btn" style="background:#22aa66" onclick="loadSaved()">📂 LOAD SAVED</button>
+      <button class="btn" style="background:#cc8800" onclick="saveToAdmin()">💾 SAVE DATA</button>
+      <span id="savedCountBadge" style="font-size:10px;color:#22aa66;font-weight:900"></span>
     </div>
   </div>
 
@@ -1034,6 +1105,47 @@ function resetAll(){
 
 document.addEventListener('keydown',e=>{if(e.ctrlKey&&e.key==='Enter')enlistAccounts();});
 
+// ── SAVED ACCOUNTS INTEGRATION ────────────────────────────────────────────────
+async function loadSaved(){
+  const r = await fetch('/admin/list').then(r=>r.json()).catch(()=>({accounts:[]}));
+  const accts = r.accounts || [];
+  if(!accts.length){ showToast('📭 Koi saved account nahi hai — Admin se pehle save karo'); return; }
+  const lines = accts.map(a=>a.line).join('\n');
+  document.getElementById('accts').value = lines;
+  showToast(`✅ ${accts.length} saved accounts loaded!`);
+  refreshSavedCount();
+}
+
+async function saveToAdmin(){
+  const raw = document.getElementById('accts').value.trim();
+  if(!raw){ showToast('Pehle textarea mein data paste karo'); return; }
+  const lines = raw.split('\n').map(l=>l.trim()).filter(l=>l&&l.includes('|')&&l.split('|').length>=3);
+  if(!lines.length){ showToast('Valid format nahi mila'); return; }
+  const r = await fetch('/admin/save',{
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({lines})
+  }).then(r=>r.json()).catch(()=>({error:'Failed'}));
+  if(r.error){ showToast('❌ '+r.error); return; }
+  showToast(`💾 ${r.added} new saved! Total: ${r.total}`);
+  refreshSavedCount();
+}
+
+async function refreshSavedCount(){
+  try{
+    const r = await fetch('/admin/list').then(r=>r.json());
+    const badge = document.getElementById('savedCountBadge');
+    if(badge) badge.textContent = r.total>0 ? `(${r.total} saved)` : '';
+  } catch{}
+}
+
+// Check if redirected from Admin with loaded data
+(function(){
+  const loaded = sessionStorage.getItem('loadedAccounts');
+  if(loaded){ document.getElementById('accts').value=loaded; sessionStorage.removeItem('loadedAccounts'); showToast('✅ Saved accounts loaded from Admin!'); }
+  refreshSavedCount();
+})();
+
+
 // ── TUNNEL JS ─────────────────────────────────────────────────────────────────
 let tunnelPollTimer = null;
 let tunnelProgVal   = 0;
@@ -1242,6 +1354,19 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(TunnelManager.state())
             return
 
+        if p == "/admin/list":
+            if not self.is_authed():
+                self.send_json({"error":"Not authenticated"}); return
+            self.send_json({"accounts": AccountStore.all(), "total": AccountStore.count()})
+            return
+
+        if p == "/admin":
+            if not self.is_authed():
+                self.send_html(LOGIN_HTML.format(err="")); return
+            html = ADMIN_HTML.replace("__SERVER_IP__", LOCAL_IP).replace("__SERVER_PORT__", str(port))
+            self.send_html(html)
+            return
+
         if not self.is_authed():
             self.send_html(LOGIN_HTML.format(err="")); return
         # Inject real server IP and port into HTML
@@ -1332,7 +1457,359 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": True})
             return
 
+        # ── ADMIN: Save accounts ──────────────────────────────────────────
+        if p == "/admin/save":
+            if not self.is_authed():
+                self.send_json({"error":"Not authenticated"}); return
+            try:
+                payload = json.loads(self.body())
+                lines   = payload.get("lines", [])
+                added   = AccountStore.add_lines(lines)
+                total   = AccountStore.count()
+                self.send_json({"ok": True, "added": added, "total": total})
+            except Exception as e:
+                self.send_json({"error": str(e)})
+            return
+
+        if p == "/admin/delete":
+            if not self.is_authed():
+                self.send_json({"error":"Not authenticated"}); return
+            try:
+                payload = json.loads(self.body())
+                acc_id  = payload.get("id","")
+                deleted = AccountStore.delete_by_id(acc_id)
+                self.send_json({"ok": True, "deleted": deleted, "total": AccountStore.count()})
+            except Exception as e:
+                self.send_json({"error": str(e)})
+            return
+
+        if p == "/admin/delete_all":
+            if not self.is_authed():
+                self.send_json({"error":"Not authenticated"}); return
+            AccountStore.delete_all()
+            self.send_json({"ok": True, "total": 0})
+            return
+
         self.send_html("Not found",404)
+
+
+ADMIN_HTML = r"""<!DOCTYPE html>
+<html><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin — OTP Reader</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#f0f2f8;color:#1a1a2e;font-family:'Courier New',monospace;font-weight:700;min-height:100vh}
+header{background:#1a1a2e;border-bottom:2px solid #333;padding:13px 24px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
+.brand{color:#fff;font-size:14px;font-weight:900;letter-spacing:3px}
+.hright{display:flex;gap:12px;align-items:center}
+.abtn{padding:6px 14px;border-radius:7px;font-size:11px;font-family:inherit;cursor:pointer;font-weight:900;letter-spacing:1px;border:none;transition:all .2s}
+.abtn-blue{background:#4455ff;color:#fff}.abtn-blue:hover{background:#3344dd}
+.abtn-red{background:#cc3333;color:#fff}.abtn-red:hover{background:#aa2222}
+.abtn-grey{background:#555;color:#fff}.abtn-grey:hover{background:#333}
+.abtn-green{background:#22aa66;color:#fff}.abtn-green:hover{background:#1a8850}
+.wrap{max-width:1100px;margin:0 auto;padding:22px 16px}
+.panel{background:#fff;border:2px solid #dde1ea;border-radius:14px;padding:22px;margin-bottom:18px;box-shadow:0 2px 12px rgba(0,0,0,.05)}
+.panel-title{color:#4455ff;font-size:10px;letter-spacing:3px;font-weight:900;margin-bottom:14px;text-transform:uppercase}
+
+/* Stats row */
+.stats{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px}
+.stat-box{background:#fff;border:2px solid #dde1ea;border-radius:12px;padding:16px 22px;text-align:center;flex:1;min-width:120px}
+.stat-num{font-size:32px;font-weight:900;color:#4455ff;line-height:1}
+.stat-lbl{font-size:9px;color:#aaa;letter-spacing:2px;margin-top:4px;text-transform:uppercase}
+
+/* Add accounts area */
+textarea{width:100%;height:90px;background:#f9fafc;border:2px solid #dde1ea;border-radius:8px;color:#1a1a2e;font-size:11.5px;font-family:inherit;font-weight:700;padding:11px;resize:vertical;outline:none;transition:border-color .2s}
+textarea:focus{border-color:#4455ff}
+textarea::placeholder{color:#ccc}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}
+
+/* Search */
+.search-box{width:100%;padding:10px 14px;background:#f9fafc;border:2px solid #dde1ea;border-radius:8px;color:#1a1a2e;font-size:12px;font-family:inherit;font-weight:700;outline:none;margin-bottom:14px;transition:border-color .2s}
+.search-box:focus{border-color:#4455ff}
+
+/* Table */
+.tbl{width:100%;border-collapse:collapse;font-size:11px}
+.tbl th{background:#f0f2ff;color:#4455ff;font-size:9px;letter-spacing:2px;text-transform:uppercase;padding:10px 12px;text-align:left;border-bottom:2px solid #dde1ea;position:sticky;top:60px;z-index:10}
+.tbl td{padding:10px 12px;border-bottom:1px solid #f0f1f6;vertical-align:middle}
+.tbl tr:hover td{background:#fafbff}
+.tbl tr:last-child td{border-bottom:none}
+.email-td{font-weight:900;color:#1a1a2e;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.uid-td{color:#4455ff;font-weight:900;max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.date-td{color:#aaa;font-size:10px;white-space:nowrap}
+.line-td{color:#888;font-size:9.5px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}
+.line-td:hover{color:#4455ff}
+.del-btn{padding:4px 10px;background:#fff5f5;border:1.5px solid #ffcccc;border-radius:5px;color:#cc3333;font-size:9.5px;font-family:inherit;cursor:pointer;font-weight:900;transition:all .15s;white-space:nowrap}
+.del-btn:hover{background:#cc3333;color:#fff}
+
+/* Bulk actions */
+.bulk-bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:12px 16px;background:#fff8f8;border:2px solid #ffcccc;border-radius:10px;margin-bottom:14px}
+.sel-count{color:#cc3333;font-size:11px;font-weight:900}
+.chk-all{accent-color:#4455ff;width:15px;height:15px;cursor:pointer}
+
+/* Pagination */
+.pager{display:flex;gap:8px;align-items:center;margin-top:14px;flex-wrap:wrap}
+.page-btn{padding:5px 12px;background:#f0f2ff;border:1.5px solid #c0c8ff;border-radius:6px;color:#4455ff;font-size:10.5px;font-family:inherit;cursor:pointer;font-weight:900;transition:all .15s}
+.page-btn:hover{background:#4455ff;color:#fff}
+.page-btn.active{background:#4455ff;color:#fff}
+.page-info{color:#888;font-size:10.5px;font-weight:700}
+
+/* Toast */
+.toast{position:fixed;bottom:20px;right:20px;background:#1a1a2e;color:#fff;padding:11px 22px;border-radius:10px;font-size:12px;font-weight:900;opacity:0;transition:opacity .3s;pointer-events:none;box-shadow:0 4px 20px rgba(0,0,0,.25);z-index:999}
+.toast.show{opacity:1}
+
+/* Empty state */
+.empty{text-align:center;padding:50px 0;color:#bbb;font-size:13px;font-weight:700}
+</style></head>
+<body>
+<header>
+  <span class="brand">🛡️ ADMIN PANEL</span>
+  <div class="hright">
+    <a href="/" style="color:#aaa;font-size:11px;font-weight:900;text-decoration:none">← BACK TO APP</a>
+    <a href="/logout" style="color:#cc3333;font-size:11px;font-weight:900;text-decoration:none;border:1.5px solid #cc3333;padding:4px 10px;border-radius:6px">LOGOUT</a>
+  </div>
+</header>
+<div class="wrap">
+
+  <!-- Stats -->
+  <div class="stats" id="statsRow">
+    <div class="stat-box"><div class="stat-num" id="statTotal">—</div><div class="stat-lbl">Total Accounts</div></div>
+    <div class="stat-box"><div class="stat-num" id="statSelected" style="color:#cc8800">0</div><div class="stat-lbl">Selected</div></div>
+    <div class="stat-box"><div class="stat-num" id="statFiltered" style="color:#22aa66">—</div><div class="stat-lbl">Showing</div></div>
+  </div>
+
+  <!-- Add Accounts -->
+  <div class="panel">
+    <div class="panel-title">➕ ADD NEW ACCOUNTS</div>
+    <textarea id="addInput" placeholder="uid|fbpass|email|emailpass|refresh_token|client_id&#10;Ya old format: email|emailpass|refresh_token&#10;&#10;Multiple accounts: har line pe ek"></textarea>
+    <div class="row">
+      <button class="abtn abtn-green" onclick="saveAccounts()">💾 SAVE ACCOUNTS</button>
+      <span id="saveMsg" style="font-size:11px;color:#22aa66;font-weight:900"></span>
+    </div>
+  </div>
+
+  <!-- Accounts Table -->
+  <div class="panel">
+    <div class="panel-title">📋 SAVED ACCOUNTS</div>
+    <input class="search-box" id="searchBox" placeholder="🔍 Search by email or UID..." oninput="applyFilter()">
+
+    <!-- Bulk actions bar -->
+    <div class="bulk-bar" id="bulkBar" style="display:none">
+      <span class="sel-count" id="selCount">0 selected</span>
+      <button class="abtn abtn-red" style="font-size:10px;padding:5px 12px" onclick="deleteSelected()">🗑️ DELETE SELECTED</button>
+      <button class="abtn abtn-grey" style="font-size:10px;padding:5px 12px" onclick="clearSelection()">✕ CLEAR</button>
+    </div>
+
+    <div style="overflow-x:auto">
+      <table class="tbl">
+        <thead>
+          <tr>
+            <th><input type="checkbox" class="chk-all" id="checkAll" onchange="toggleAll(this)"></th>
+            <th>#</th>
+            <th>EMAIL</th>
+            <th>UID</th>
+            <th>LINE PREVIEW</th>
+            <th>ADDED</th>
+            <th>ACTION</th>
+          </tr>
+        </thead>
+        <tbody id="tblBody"></tbody>
+      </table>
+    </div>
+    <div class="empty" id="emptyMsg" style="display:none">📭 No accounts saved yet. Add some above!</div>
+
+    <!-- Pager -->
+    <div class="pager" id="pager"></div>
+
+    <!-- Delete all -->
+    <div style="margin-top:16px;padding-top:14px;border-top:1.5px solid #f0f1f6;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <button class="abtn abtn-red" onclick="deleteAll()">🗑️ DELETE ALL ACCOUNTS</button>
+      <button class="abtn abtn-blue" onclick="loadToApp()">⚡ LOAD ALL TO APP</button>
+      <span style="font-size:10px;color:#aaa;font-weight:700">Load to App = saved accounts textarea mein paste ho jayenge</span>
+    </div>
+  </div>
+
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+let ALL_ACCOUNTS = [];
+let FILTERED     = [];
+let SELECTED     = new Set();
+const PAGE_SIZE  = 50;
+let currentPage  = 1;
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+function toast(msg, dur=2200){
+  const t=document.getElementById('toast');
+  t.textContent=msg; t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'),dur);
+}
+
+// ── Load accounts from server ─────────────────────────────────────────────────
+async function loadAccounts(){
+  const r = await fetch('/admin/list').then(r=>r.json());
+  ALL_ACCOUNTS = r.accounts || [];
+  applyFilter();
+  updateStats();
+}
+
+function applyFilter(){
+  const q = document.getElementById('searchBox').value.trim().toLowerCase();
+  FILTERED = q
+    ? ALL_ACCOUNTS.filter(a=>
+        (a.email||'').toLowerCase().includes(q) ||
+        (a.uid||'').toLowerCase().includes(q))
+    : [...ALL_ACCOUNTS];
+  currentPage = 1;
+  renderPage();
+  updateStats();
+}
+
+function renderPage(){
+  const tbody   = document.getElementById('tblBody');
+  const empty   = document.getElementById('emptyMsg');
+  const start   = (currentPage-1)*PAGE_SIZE;
+  const slice   = FILTERED.slice(start, start+PAGE_SIZE);
+
+  if(!FILTERED.length){
+    tbody.innerHTML=''; empty.style.display='block';
+    document.getElementById('pager').innerHTML=''; return;
+  }
+  empty.style.display='none';
+
+  tbody.innerHTML = slice.map((a,i)=>`
+    <tr id="row_${a.id}">
+      <td><input type="checkbox" class="chk-all" data-id="${a.id}"
+          ${SELECTED.has(a.id)?'checked':''} onchange="toggleSel('${a.id}',this)"></td>
+      <td style="color:#aaa;font-size:11px">${start+i+1}</td>
+      <td class="email-td" title="${esc(a.email)}">${esc(a.email)}</td>
+      <td class="uid-td">${a.uid ? esc(a.uid) : '<span style="color:#ddd">—</span>'}</td>
+      <td class="line-td" title="${esc(a.line)}" onclick="copyLine('${a.id}')">${esc((a.line||'').slice(0,60))}...</td>
+      <td class="date-td">${esc(a.added_at||'')}</td>
+      <td>
+        <button class="del-btn" onclick="deleteSingle('${a.id}')">🗑️ DEL</button>
+      </td>
+    </tr>`).join('');
+
+  renderPager();
+}
+
+function renderPager(){
+  const total = FILTERED.length;
+  const pages = Math.ceil(total/PAGE_SIZE);
+  const pager = document.getElementById('pager');
+  if(pages<=1){pager.innerHTML='';return;}
+  let html = `<span class="page-info">${total} accounts · Page ${currentPage}/${pages}</span>`;
+  if(currentPage>1) html+=`<button class="page-btn" onclick="goPage(${currentPage-1})">← PREV</button>`;
+  for(let p=Math.max(1,currentPage-2);p<=Math.min(pages,currentPage+2);p++)
+    html+=`<button class="page-btn ${p===currentPage?'active':''}" onclick="goPage(${p})">${p}</button>`;
+  if(currentPage<pages) html+=`<button class="page-btn" onclick="goPage(${currentPage+1})">NEXT →</button>`;
+  pager.innerHTML=html;
+}
+
+function goPage(p){ currentPage=p; renderPage(); }
+
+// ── Stats ─────────────────────────────────────────────────────────────────────
+function updateStats(){
+  document.getElementById('statTotal').textContent    = ALL_ACCOUNTS.length;
+  document.getElementById('statFiltered').textContent = FILTERED.length;
+  document.getElementById('statSelected').textContent = SELECTED.size;
+  const bulk = document.getElementById('bulkBar');
+  bulk.style.display = SELECTED.size>0 ? 'flex' : 'none';
+  document.getElementById('selCount').textContent = `${SELECTED.size} selected`;
+}
+
+// ── Selection ─────────────────────────────────────────────────────────────────
+function toggleSel(id, el){
+  if(el.checked) SELECTED.add(id); else SELECTED.delete(id);
+  updateStats();
+}
+
+function toggleAll(el){
+  FILTERED.forEach(a=> el.checked ? SELECTED.add(a.id) : SELECTED.delete(a.id));
+  renderPage(); updateStats();
+}
+
+function clearSelection(){
+  SELECTED.clear(); renderPage(); updateStats();
+}
+
+// ── Save ──────────────────────────────────────────────────────────────────────
+async function saveAccounts(){
+  const raw = document.getElementById('addInput').value.trim();
+  if(!raw){ alert('Koi data nahi hai'); return; }
+  const lines = raw.split('\n').map(l=>l.trim()).filter(l=>l&&l.includes('|'));
+  if(!lines.length){ alert('Valid format nahi mila'); return; }
+  const r = await fetch('/admin/save',{
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({lines})
+  }).then(r=>r.json());
+  if(r.error){ toast('❌ '+r.error); return; }
+  document.getElementById('addInput').value='';
+  document.getElementById('saveMsg').textContent=`✅ ${r.added} added · Total: ${r.total}`;
+  setTimeout(()=>document.getElementById('saveMsg').textContent='',3000);
+  toast(`✅ ${r.added} new accounts saved! Total: ${r.total}`);
+  await loadAccounts();
+}
+
+// ── Delete ────────────────────────────────────────────────────────────────────
+async function deleteSingle(id){
+  if(!confirm('Delete this account?')) return;
+  const r = await fetch('/admin/delete',{
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id})
+  }).then(r=>r.json());
+  if(r.ok){ toast('🗑️ Deleted · Remaining: '+r.total); SELECTED.delete(id); await loadAccounts(); }
+  else toast('❌ '+r.error);
+}
+
+async function deleteSelected(){
+  if(!SELECTED.size){ alert('Koi account select nahi hai'); return; }
+  if(!confirm(`${SELECTED.size} accounts delete karo?`)) return;
+  for(const id of [...SELECTED]){
+    await fetch('/admin/delete',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id})
+    });
+    SELECTED.delete(id);
+  }
+  toast(`🗑️ ${SELECTED.size} accounts deleted`);
+  await loadAccounts();
+}
+
+async function deleteAll(){
+  if(!confirm('⚠️ SAARE accounts delete ho jayenge! Sure?')) return;
+  if(!confirm('Bilkul sure? Ye undo nahi hoga!')) return;
+  await fetch('/admin/delete_all',{method:'POST'});
+  SELECTED.clear();
+  toast('🗑️ All accounts deleted');
+  await loadAccounts();
+}
+
+// ── Load to App ───────────────────────────────────────────────────────────────
+function loadToApp(){
+  if(!ALL_ACCOUNTS.length){ alert('Koi saved account nahi hai'); return; }
+  const lines = ALL_ACCOUNTS.map(a=>a.line).join('\n');
+  // Store in sessionStorage for app page to pick up
+  sessionStorage.setItem('loadedAccounts', lines);
+  toast('✅ App pe redirect ho raha hai...');
+  setTimeout(()=>{ window.location.href='/'; }, 800);
+}
+
+// ── Copy line ─────────────────────────────────────────────────────────────────
+function copyLine(id){
+  const a = ALL_ACCOUNTS.find(x=>x.id===id);
+  if(!a) return;
+  navigator.clipboard.writeText(a.line).then(()=>toast('📋 Line copied!'));
+}
+
+function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+loadAccounts();
+</script>
+</body></html>"""
 
 
 port = 5000   # global — used in do_GET for URL injection
