@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Hotmail OTP Reader v3.0
+Hotmail OTP Reader v3.8.7
 ========================
 New in v3:
   ✅ Enlist all accounts first (show table before fetching)
@@ -175,6 +175,196 @@ class AccountStore:
     def delete_all(cls):
         with cls._lock:
             cls._save_raw([])
+
+
+# ─── Distribution / Token Store ───────────────────────────────────────────────
+DIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "distributions.json")
+
+class DistributionStore:
+    """Manage user tokens and their assigned accounts."""
+    _lock = threading.Lock()
+
+    @classmethod
+    def _load(cls):
+        try:
+            with open(DIST_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except: return []
+
+    @classmethod
+    def _save(cls, data):
+        with open(DIST_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    @classmethod
+    def all(cls):
+        with cls._lock: return cls._load()
+
+    @classmethod
+    def active(cls):
+        """Return non-expired distributions."""
+        now = _time.time()
+        with cls._lock:
+            data = cls._load()
+            return [d for d in data if d.get("expires_at") is None or d["expires_at"] > now]
+
+    @classmethod
+    def get_by_token(cls, token):
+        """Get distribution by token (None if not found or expired)."""
+        now = _time.time()
+        with cls._lock:
+            for d in cls._load():
+                if d["token"] == token:
+                    if d.get("expires_at") and d["expires_at"] < now:
+                        return None  # expired
+                    return d
+        return None
+
+    @classmethod
+    def create(cls, distributions: list) -> list:
+        """
+        Create new distributions. Each item: {name, account_ids, expires_at}
+        Clears previous distributions first (new set each time).
+        Returns list of created tokens.
+        """
+        import secrets
+        now = _time.time()
+        new_dists = []
+        for item in distributions:
+            token = secrets.token_urlsafe(16)
+            new_dists.append({
+                "token":       token,
+                "user_name":   item["name"],
+                "account_ids": item["account_ids"],
+                "created_at":  now,
+                "expires_at":  item.get("expires_at"),   # None = permanent
+                "count":       len(item["account_ids"]),
+            })
+        with cls._lock:
+            cls._save(new_dists)
+        return new_dists
+
+    @classmethod
+    def revoke(cls, token):
+        with cls._lock:
+            data = [d for d in cls._load() if d["token"] != token]
+            cls._save(data)
+
+    @classmethod
+    def clear_all(cls):
+        with cls._lock: cls._save([])
+
+
+
+
+# ─── User Token Store ─────────────────────────────────────────────────────────
+import secrets, datetime as _dt
+
+TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_tokens.json")
+
+class TokenStore:
+    """Manage user distribution tokens."""
+    _lock = threading.Lock()
+
+    @classmethod
+    def _load(cls):
+        try:
+            with open(TOKEN_FILE,"r",encoding="utf-8") as f:
+                d = json.load(f)
+                return d if isinstance(d,list) else []
+        except: return []
+
+    @classmethod
+    def _save(cls, data):
+        with open(TOKEN_FILE,"w",encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    @classmethod
+    def all(cls):
+        with cls._lock: return cls._load()
+
+    @classmethod
+    def get_by_token(cls, token):
+        for t in cls._load():
+            if t.get("token") == token:
+                return t
+        return None
+
+    @classmethod
+    def is_valid(cls, token):
+        t = cls.get_by_token(token)
+        if not t: return False, "Token not found"
+        if t.get("expiry_type") == "permanent": return True, t
+        exp = t.get("expires_at","")
+        if not exp: return True, t
+        try:
+            exp_dt = _dt.datetime.fromisoformat(exp)
+            if _dt.datetime.now() > exp_dt:
+                return False, "Token expired"
+        except: pass
+        return True, t
+
+    @classmethod
+    def create(cls, user_name, account_ids, expiry_type="48h"):
+        with cls._lock:
+            data = cls._load()
+            token = secrets.token_urlsafe(20)
+            now   = _dt.datetime.now()
+            if expiry_type == "48h":
+                expires_at = (now + _dt.timedelta(hours=48)).strftime("%Y-%m-%d %H:%M")
+            elif expiry_type == "7d":
+                expires_at = (now + _dt.timedelta(days=7)).strftime("%Y-%m-%d %H:%M")
+            else:
+                expires_at = None  # permanent
+            entry = {
+                "token":       token,
+                "user_name":   user_name,
+                "account_ids": account_ids,
+                "created_at":  now.strftime("%Y-%m-%d %H:%M"),
+                "expires_at":  expires_at,
+                "expiry_type": expiry_type,
+            }
+            data.append(entry)
+            cls._save(data)
+            return entry
+
+    @classmethod
+    def delete(cls, token):
+        with cls._lock:
+            data = cls._load()
+            new  = [t for t in data if t.get("token") != token]
+            cls._save(new)
+            return len(data) - len(new)
+
+    @classmethod
+    def delete_all(cls):
+        with cls._lock: cls._save([])
+
+    @classmethod
+    def refresh_token(cls, old_token, account_ids=None, expiry_type=None):
+        """Regenerate token string + optionally new accounts + reset expiry."""
+        with cls._lock:
+            data  = cls._load()
+            entry = next((t for t in data if t.get("token")==old_token), None)
+            if not entry: return None
+            new_tok = secrets.token_urlsafe(20)
+            entry["token"] = new_tok
+            if account_ids is not None:
+                entry["account_ids"] = account_ids
+            if expiry_type is not None:
+                entry["expiry_type"] = expiry_type
+            now = _dt.datetime.now()
+            entry["created_at"] = now.strftime("%Y-%m-%d %H:%M")
+            et = entry["expiry_type"]
+            if et == "48h":
+                entry["expires_at"] = (now + _dt.timedelta(hours=48)).strftime("%Y-%m-%d %H:%M")
+            elif et == "7d":
+                entry["expires_at"] = (now + _dt.timedelta(days=7)).strftime("%Y-%m-%d %H:%M")
+            else:
+                entry["expires_at"] = None
+            cls._save(data)
+            return entry
+
 
 MSA_DOMAINS = {
     "hotmail.com","hotmail.co.uk","outlook.com","live.com",
@@ -396,7 +586,36 @@ def parse_account_line(line):
                 "emailpass": p[1].strip(), "refresh_token": rt,
                 "client_id": cid, "format": "old"}
 
-    return None
+
+# ─── TOTP 2FA Generator ────────────────────────────────────────────────────────
+import hmac, struct, base64, time as _time_mod, hashlib as _hashlib
+
+def generate_totp(secret_key: str, digits: int = 6, period: int = 30) -> dict:
+    """Generate 6-digit TOTP from base32 secret key (Google Authenticator style)."""
+    try:
+        # Clean key — remove spaces, dashes, uppercase
+        key = secret_key.strip().upper().replace(" ", "").replace("-", "")
+        # Pad if needed
+        pad = len(key) % 8
+        if pad: key += "=" * (8 - pad)
+        key_bytes = base64.b32decode(key)
+
+        # TOTP counter
+        ts       = int(_time_mod.time())
+        counter  = ts // period
+        remaining = period - (ts % period)
+
+        # HMAC-SHA1
+        msg    = struct.pack(">Q", counter)
+        h      = hmac.new(key_bytes, msg, _hashlib.sha1).digest()
+        offset = h[-1] & 0x0F
+        code   = struct.unpack(">I", h[offset:offset+4])[0] & 0x7FFFFFFF
+        otp    = str(code % (10 ** digits)).zfill(digits)
+
+        return {"otp": otp, "remaining": remaining, "ok": True}
+    except Exception as e:
+        return {"error": str(e), "ok": False}
+
 
 def fetch_latest_otp(account, limit=20):
     """Fetch emails and return ONLY the latest OTP found."""
@@ -542,13 +761,13 @@ select{padding:9px 13px;background:#f9fafc;border:2px solid #dde1ea;border-radiu
 .tbl-wrap{background:#fff;border:2px solid #dde1ea;border-radius:14px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.06)}
 .tbl-head{
   display:grid;
-  grid-template-columns:36px 52px minmax(140px,1fr) 110px minmax(120px,1.2fr) 86px 130px;
+  grid-template-columns:28px 36px 52px minmax(140px,1fr) 110px minmax(120px,1.2fr) 86px 130px;
   background:#f0f2ff;border-bottom:2px solid #dde1ea;
   padding:10px 14px;font-size:9px;color:#4455ff;letter-spacing:2px;font-weight:900;text-transform:uppercase
 }
 .row-item{
   display:grid;
-  grid-template-columns:36px 52px minmax(140px,1fr) 110px minmax(120px,1.2fr) 86px 130px;
+  grid-template-columns:28px 36px 52px minmax(140px,1fr) 110px minmax(120px,1.2fr) 86px 130px;
   padding:11px 14px;border-bottom:1.5px solid #f0f1f6;align-items:center;
   transition:background .15s;gap:4px
 }
@@ -630,8 +849,9 @@ select{padding:9px 13px;background:#f9fafc;border:2px solid #dde1ea;border-radiu
 <header>
   <span class="brand">🔐 OTP READER</span>
   <div class="hright">
-    <span class="ver">V3.0</span>
+    <span class="ver">V3.7</span>
     <button class="net-btn" onclick="toggleQR()" title="Same WiFi access">📱 WIFI</button>
+    <button class="net-btn" onclick="toggle2FAPanel()" id="btn2FA" title="Generate 2FA TOTP code from secret key" style="background:#fff0ff;border-color:#ddaaff;color:#8833bb">🔑 GET 2FA</button>
     <button class="net-btn tunnel-btn" id="tunnelBtn" onclick="toggleTunnel()" title="Access from any network">🌐 PUBLIC URL</button>
     <a href="/admin" class="net-btn" style="text-decoration:none;background:#fff8e6;border-color:#ffddaa;color:#cc8800" title="Admin Panel">🛡️ ADMIN</a>
     <a href="/logout" class="logout">LOGOUT</a>
@@ -717,6 +937,41 @@ select{padding:9px 13px;background:#f9fafc;border:2px solid #dde1ea;border-radiu
   </div>
 </div>
 
+
+<!-- ── 2FA PANEL ── -->
+<div id="panel2FA" style="display:none;background:#fff5ff;border-bottom:2px solid #ddaaff;padding:16px 24px;box-shadow:0 2px 8px rgba(0,0,0,.07)">
+  <div style="max-width:900px;margin:0 auto">
+    <div style="font-size:11px;font-weight:900;color:#8833bb;letter-spacing:2px;margin-bottom:12px">🔑 2FA CODE GENERATOR — 6-DIGIT TOTP FROM SECRET KEY</div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
+      <input id="tfaKeyInput" type="text" placeholder="Paste 2FA secret key here (e.g. U3KOCP2GHFNBXHLULXOJ)"
+        style="flex:1;min-width:220px;padding:10px 14px;background:#fff;border:2px solid #ddaaff;border-radius:8px;color:#1a1a2e;font-size:12px;font-family:inherit;font-weight:700;outline:none"
+        onkeydown="if(event.key==='Enter')gen2FA()">
+      <button class="btn" onclick="gen2FA()" style="background:#8833bb;padding:10px 20px;white-space:nowrap">⚡ GENERATE</button>
+      <button class="btn btn-grey btn-sm" onclick="clearTFA()">✕ CLEAR</button>
+    </div>
+    <div id="tfaResult" style="display:none;background:#fff;border:2px solid #ddaaff;border-radius:10px;padding:14px 20px;display:flex;align-items:center;gap:20px;flex-wrap:wrap">
+      <div>
+        <div style="font-size:9px;font-weight:900;color:#8833bb;letter-spacing:2px;margin-bottom:4px">6-DIGIT CODE</div>
+        <div id="tfaCode" style="font-size:38px;font-weight:900;color:#8833bb;letter-spacing:8px;cursor:pointer;user-select:none" onclick="copyTFA()" title="Click to copy">——————</div>
+      </div>
+      <div>
+        <div style="font-size:9px;font-weight:900;color:#aaa;letter-spacing:2px;margin-bottom:4px">EXPIRES IN</div>
+        <div id="tfaTimer" style="font-size:22px;font-weight:900;color:#cc8800;letter-spacing:2px">—s</div>
+        <div style="margin-top:6px;background:#eee;border-radius:4px;height:5px;width:120px;overflow:hidden">
+          <div id="tfaTimerBar" style="background:linear-gradient(90deg,#8833bb,#cc55ff);height:5px;width:100%;transition:width 1s linear"></div>
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <button class="btn btn-sm" onclick="copyTFA()" style="background:#8833bb">📋 COPY CODE</button>
+        <button class="btn btn-sm btn-grey" onclick="gen2FA()">🔄 REFRESH</button>
+      </div>
+    </div>
+    <div style="font-size:10px;color:#888;font-weight:700;margin-top:8px">
+      💡 Key format: <code style="background:#f5e6ff;padding:1px 5px;border-radius:3px">U3KOCP2GHFNBXHLULXOJ</code> &nbsp;·&nbsp; Auto-refreshes every 30s &nbsp;·&nbsp; Click code to copy
+    </div>
+  </div>
+</div>
+
 <div class="wrap">
 
   <!-- ── INPUT PANEL ── -->
@@ -765,6 +1020,7 @@ select{padding:9px 13px;background:#f9fafc;border:2px solid #dde1ea;border-radiu
       </div>
       <div class="tbl-wrap">
         <div class="tbl-head">
+          <div><input type="checkbox" id="chkAll" onchange="toggleAllChk(this)" title="Select all"></div>
           <div>#</div>
           <div>UID</div>
           <div>EMAIL</div>
@@ -787,9 +1043,29 @@ select{padding:9px 13px;background:#f9fafc;border:2px solid #dde1ea;border-radiu
   </div>
 
   <!-- ── ACTION BUTTONS ── -->
-  <div class="row" id="actionRow" style="display:none;margin-top:14px">
-    <button class="btn btn-green" id="fetchAllBtn" onclick="fetchAllOTPs()">⚡ FETCH ALL OTPs</button>
-    <button class="btn btn-grey btn-sm" onclick="resetAll()">🔄 RESET</button>
+  <div id="actionRow" style="display:none;margin-top:14px">
+    <!-- Row 1: Fetch + Reset -->
+    <div class="row" style="margin-bottom:8px">
+      <button class="btn btn-green" id="fetchAllBtn" onclick="fetchAllOTPs()">⚡ FETCH ALL OTPs</button>
+      <button class="btn btn-grey btn-sm" onclick="resetAll()">🔄 RESET</button>
+    </div>
+    <!-- Row 2: Bulk copy + select -->
+    <div class="row" style="gap:8px;flex-wrap:wrap">
+      <span style="font-size:10px;color:#888;font-weight:900;letter-spacing:1px;align-self:center">BULK:</span>
+      <button class="btn btn-sm" onclick="copyAllUidPass()" style="background:#cc8800">👥 COPY ALL UID|PASS</button>
+      <button class="btn btn-sm" onclick="copyAllOTPs()" style="background:#22aa66">📋 COPY ALL OTPs</button>
+      <button class="btn btn-sm" onclick="selectFirst(50)" style="background:#4455ff">✅ SELECT 50</button>
+      <button class="btn btn-sm" onclick="selectFirst(100)" style="background:#4455ff">✅ SELECT 100</button>
+      <button class="btn btn-sm" onclick="selectFirst(200)" style="background:#4455ff">✅ SELECT 200</button>
+      <button class="btn btn-sm btn-grey" onclick="selectAll()">☑ ALL</button>
+      <button class="btn btn-sm btn-grey" onclick="clearSel()">✕ CLEAR SEL</button>
+    </div>
+    <!-- Row 3: Selection copy -->
+    <div class="row" id="selActionRow" style="display:none;margin-top:6px;padding:10px;background:#f0f2ff;border-radius:8px;border:1.5px solid #c0c8ff">
+      <span id="selCountLabel" style="font-size:11px;color:#4455ff;font-weight:900;align-self:center">0 selected</span>
+      <button class="btn btn-sm" onclick="copySelectedUidPass()" style="background:#cc8800">👥 COPY SEL UID|PASS</button>
+      <button class="btn btn-sm" onclick="copySelectedOTPs()" style="background:#22aa66">📋 COPY SEL OTPs</button>
+    </div>
   </div>
 
 </div>
@@ -850,6 +1126,7 @@ function enlistAccounts(){
 function buildDesktopTable(){
   document.getElementById('tableBody').innerHTML = accounts.map(a=>`
     <div class="row-item" id="row_${a.idx}">
+      <div><input type="checkbox" class="row-chk" data-idx="${a.idx}" onchange="onRowChk(${a.idx},this)"></div>
       <div class="num-cell">${a.idx+1}</div>
       <div class="uid-cell" title="${esc(a.uid)}">${a.uid ? esc(a.uid) : '<span style="color:#ccc">—</span>'}</div>
       <div class="email-cell" title="${esc(a.email)}">${esc(a.email)}</div>
@@ -1146,6 +1423,192 @@ async function refreshSavedCount(){
 })();
 
 
+
+// ── SELECTION STATE ───────────────────────────────────────────────────────────
+let selectedIdxs = new Set();
+
+function onRowChk(idx, el){
+  if(el.checked) selectedIdxs.add(idx); else selectedIdxs.delete(idx);
+  updateSelRow();
+}
+
+function toggleAllChk(el){
+  document.querySelectorAll('.row-chk').forEach(c=>{
+    c.checked = el.checked;
+    const i = parseInt(c.dataset.idx);
+    if(el.checked) selectedIdxs.add(i); else selectedIdxs.delete(i);
+  });
+  updateSelRow();
+}
+
+function selectFirst(n){
+  selectedIdxs.clear();
+  accounts.slice(0, n).forEach(a=> selectedIdxs.add(a.idx));
+  document.querySelectorAll('.row-chk').forEach(c=>{
+    const i = parseInt(c.dataset.idx);
+    c.checked = selectedIdxs.has(i);
+  });
+  updateSelRow();
+  showToast(`☑ ${Math.min(n, accounts.length)} accounts selected`);
+}
+
+function selectAll(){
+  selectedIdxs.clear();
+  accounts.forEach(a=> selectedIdxs.add(a.idx));
+  document.querySelectorAll('.row-chk').forEach(c=>{ c.checked=true; });
+  updateSelRow();
+  showToast(`☑ All ${accounts.length} selected`);
+}
+
+function clearSel(){
+  selectedIdxs.clear();
+  document.querySelectorAll('.row-chk').forEach(c=>{ c.checked=false; });
+  const ca = document.getElementById('chkAll');
+  if(ca) ca.checked=false;
+  updateSelRow();
+}
+
+function updateSelRow(){
+  const row = document.getElementById('selActionRow');
+  const lbl = document.getElementById('selCountLabel');
+  if(selectedIdxs.size > 0){
+    row.style.display='flex';
+    if(lbl) lbl.textContent = `${selectedIdxs.size} accounts selected`;
+  } else {
+    row.style.display='none';
+  }
+}
+
+// ── BULK COPY ALL UID|PASS ────────────────────────────────────────────────────
+function copyAllUidPass(){
+  const lines = accounts
+    .map(a=>{
+      const p = a.line.split('|');
+      const uid = a.uid || (p.length>=5 ? p[0].trim() : '');
+      const pass = p.length>=5 ? p[1].trim() : (p.length>=2 ? p[1].trim() : '');
+      return uid && pass ? uid+'|'+pass : null;
+    })
+    .filter(Boolean);
+  if(!lines.length){ showToast('❌ Koi UID|PASS nahi mila'); return; }
+  navigator.clipboard.writeText(lines.join('\n')).then(()=>
+    showToast(`✅ ${lines.length} UID|PASS copied!`));
+}
+
+function copyAllOTPs(){
+  const lines = accounts
+    .map(a=>{ const r=results[a.idx]; return r&&r.otp ? r.otp : null; })
+    .filter(Boolean);
+  if(!lines.length){ showToast('❌ Koi OTP nahi mila — pehle FETCH karo'); return; }
+  navigator.clipboard.writeText(lines.join('\n')).then(()=>
+    showToast(`✅ ${lines.length} OTPs copied!`));
+}
+
+// ── BULK COPY SELECTED ────────────────────────────────────────────────────────
+function copySelectedUidPass(){
+  if(!selectedIdxs.size){ showToast('Koi account select nahi — SELECT N pehle click karo'); return; }
+  const lines = [...selectedIdxs].sort((a,b)=>a-b).map(idx=>{
+    const a = accounts[idx];
+    if(!a) return null;
+    const p = a.line.split('|');
+    const uid  = a.uid || (p.length>=5 ? p[0].trim() : '');
+    const pass = p.length>=5 ? p[1].trim() : (p.length>=2 ? p[1].trim() : '');
+    return uid && pass ? uid+'|'+pass : null;
+  }).filter(Boolean);
+  if(!lines.length){ showToast('❌ Koi UID|PASS nahi mila'); return; }
+  navigator.clipboard.writeText(lines.join('\n')).then(()=>
+    showToast(`✅ ${lines.length} selected UID|PASS copied!`));
+}
+
+function copySelectedOTPs(){
+  if(!selectedIdxs.size){ showToast('Koi account select nahi'); return; }
+  const lines = [...selectedIdxs].sort((a,b)=>a-b).map(idx=>{
+    const r = results[idx]; return r&&r.otp ? r.otp : null;
+  }).filter(Boolean);
+  if(!lines.length){ showToast('❌ Selected accounts mein OTP nahi mila'); return; }
+  navigator.clipboard.writeText(lines.join('\n')).then(()=>
+    showToast(`✅ ${lines.length} selected OTPs copied!`));
+}
+
+// ── 2FA PANEL ─────────────────────────────────────────────────────────────────
+let tfa2FaAutoTimer = null;
+
+function toggle2FAPanel(){
+  const p = document.getElementById('panel2FA');
+  p.style.display = p.style.display==='none' ? 'block' : 'none';
+  if(p.style.display==='block') document.getElementById('tfaKeyInput').focus();
+}
+
+async function gen2FA(){
+  const key = document.getElementById('tfaKeyInput').value.trim();
+  if(!key){ showToast('❌ 2FA key paste karo pehle'); return; }
+
+  const res = await fetch('/get_2fa',{
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({key})
+  }).then(r=>r.json()).catch(e=>({error:e.message}));
+
+  const resultBox = document.getElementById('tfaResult');
+  resultBox.style.display='flex';
+
+  if(res.error){
+    document.getElementById('tfaCode').textContent='ERROR';
+    document.getElementById('tfaCode').style.color='#cc3333';
+    document.getElementById('tfaTimer').textContent=res.error.slice(0,40);
+    showToast('❌ '+res.error);
+    return;
+  }
+
+  document.getElementById('tfaCode').textContent = res.otp;
+  document.getElementById('tfaCode').style.color = '#8833bb';
+  document.getElementById('tfaTimer').textContent = res.remaining+'s';
+  document.getElementById('tfaTimerBar').style.width = (res.remaining/30*100)+'%';
+  showToast('✅ 2FA code: '+res.otp+' — Click to copy!', 3000);
+
+  // Auto countdown
+  if(tfa2FaAutoTimer) clearInterval(tfa2FaAutoTimer);
+  let rem = res.remaining;
+  tfa2FaAutoTimer = setInterval(async ()=>{
+    rem--;
+    if(rem <= 0){
+      clearInterval(tfa2FaAutoTimer);
+      // Auto refresh new code
+      await gen2FA();
+      return;
+    }
+    document.getElementById('tfaTimer').textContent = rem+'s';
+    document.getElementById('tfaTimerBar').style.width = (rem/30*100)+'%';
+    // Color warning
+    const c = document.getElementById('tfaCode');
+    c.style.color = rem<=7 ? '#cc3333' : rem<=15 ? '#cc8800' : '#8833bb';
+  }, 1000);
+}
+
+function copyTFA(){
+  const code = document.getElementById('tfaCode').textContent;
+  if(!code || code==='——————' || code==='ERROR') return;
+  navigator.clipboard.writeText(code).then(()=>showToast('📋 2FA Code copied: '+code));
+}
+
+function clearTFA(){
+  document.getElementById('tfaKeyInput').value='';
+  document.getElementById('tfaResult').style.display='none';
+  if(tfa2FaAutoTimer) clearInterval(tfa2FaAutoTimer);
+}
+
+// 2FA from per-row 2FA key (if accounts have 2fa field)
+function gen2FAForRow(idx){
+  const a = accounts[idx];
+  if(!a) return;
+  const p = a.line.split('|');
+  // Format: uid|fbpass|email|emailpass|refresh_token|client_id|2fa_key (7th field)
+  const twoFaKey = p.length >= 7 ? p[6].trim() : '';
+  if(!twoFaKey){ showToast('❌ Yeh account mein 2FA key nahi hai (7th field)'); return; }
+  document.getElementById('tfaKeyInput').value = twoFaKey;
+  document.getElementById('panel2FA').style.display='block';
+  gen2FA();
+}
+
+
 // ── TUNNEL JS ─────────────────────────────────────────────────────────────────
 let tunnelPollTimer = null;
 let tunnelProgVal   = 0;
@@ -1367,6 +1830,39 @@ class Handler(BaseHTTPRequestHandler):
             self.send_html(html)
             return
 
+        if p == "/admin/tokens":
+            if not self.is_authed():
+                self.send_json({"error":"Not authenticated"}); return
+            self.send_json({"tokens": TokenStore.all()})
+            return
+
+        if p.startswith("/u/"):
+            token = p[3:]
+            ok, result = TokenStore.is_valid(token)
+            if not ok:
+                self.send_html(f"""<!DOCTYPE html><html><body style='font-family:monospace;background:#f0f2f8;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0'>
+                <div style='background:#fff;border:2px solid #ffcccc;border-radius:14px;padding:40px;text-align:center;max-width:400px'>
+                <div style='font-size:48px;margin-bottom:16px'>🔒</div>
+                <div style='font-size:18px;font-weight:900;color:#cc3333;margin-bottom:10px'>ACCESS DENIED</div>
+                <div style='color:#888;font-size:13px;font-weight:700'>{result}</div>
+                </div></body></html>""", 403)
+                return
+            tok_data = result
+            acct_ids = tok_data.get("account_ids", [])
+            all_accts = AccountStore.all()
+            user_accts = [a for a in all_accts if a.get("id") in acct_ids]
+            lines_json = json.dumps([a["line"] for a in user_accts])
+            user_name  = tok_data.get("user_name","User")
+            expires    = tok_data.get("expires_at") or "Never"
+            html = USER_HTML \
+                .replace("__USER_NAME__", user_name) \
+                .replace("__TOKEN__", token) \
+                .replace("__EXPIRES__", expires) \
+                .replace("__ACC_COUNT__", str(len(user_accts))) \
+                .replace("__LINES_JSON__", lines_json)
+            self.send_html(html)
+            return
+
         if not self.is_authed():
             self.send_html(LOGIN_HTML.format(err="")); return
         # Inject real server IP and port into HTML
@@ -1490,6 +1986,132 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": True, "total": 0})
             return
 
+        elif p == "/get_2fa":
+            body  = json.loads(self.rfile.read(int(self.headers.get("Content-Length",0))))
+            key   = body.get("key","").strip()
+            if not key:
+                self.send_json({"error":"2FA key missing"})
+            else:
+                self.send_json(generate_totp(key))
+            return
+
+        # ── Token Management ──────────────────────────────────────────────
+        if p == "/admin/token/create":
+            if not self.is_authed():
+                self.send_json({"error":"Not authenticated"}); return
+            try:
+                payload     = json.loads(self.body())
+                user_name   = payload.get("user_name","").strip() or "User"
+                count       = int(payload.get("count", 50))
+                expiry_type = payload.get("expiry_type","48h")  # 48h | 7d | permanent
+                shuffle     = payload.get("shuffle", True)
+
+                # Get already-assigned account IDs from existing tokens
+                existing_tokens = TokenStore.all()
+                assigned_ids    = set()
+                for t in existing_tokens:
+                    assigned_ids.update(t.get("account_ids",[]))
+
+                all_accts = AccountStore.all()
+                # Unassigned accounts only
+                available = [a for a in all_accts if a.get("id") not in assigned_ids]
+
+                if shuffle:
+                    import random; random.shuffle(available)
+
+                selected = available[:count]
+                if not selected:
+                    self.send_json({"error": f"No unassigned accounts available (total={len(all_accts)}, assigned={len(assigned_ids)})"}); return
+
+                acct_ids = [a["id"] for a in selected]
+                entry    = TokenStore.create(user_name, acct_ids, expiry_type)
+                self.send_json({"ok":True, "token": entry, "count": len(acct_ids)})
+            except Exception as e:
+                self.send_json({"error": str(e)})
+            return
+
+        if p == "/admin/token/delete":
+            if not self.is_authed():
+                self.send_json({"error":"Not authenticated"}); return
+            try:
+                payload = json.loads(self.body())
+                token   = payload.get("token","")
+                deleted = TokenStore.delete(token)
+                self.send_json({"ok":True, "deleted":deleted})
+            except Exception as e:
+                self.send_json({"error":str(e)})
+            return
+
+        if p == "/admin/token/refresh":
+            if not self.is_authed():
+                self.send_json({"error":"Not authenticated"}); return
+            try:
+                payload     = json.loads(self.body())
+                old_token   = payload.get("token","")
+                new_count   = payload.get("count", None)
+                expiry_type = payload.get("expiry_type", None)
+                new_ids     = None
+
+                if new_count is not None:
+                    # Reassign fresh unassigned accounts
+                    existing  = TokenStore.all()
+                    # assigned by others (not this token)
+                    assigned  = set()
+                    for t in existing:
+                        if t.get("token") != old_token:
+                            assigned.update(t.get("account_ids",[]))
+                    available = [a for a in AccountStore.all() if a.get("id") not in assigned]
+                    import random; random.shuffle(available)
+                    selected  = available[:int(new_count)]
+                    new_ids   = [a["id"] for a in selected]
+
+                entry = TokenStore.refresh_token(old_token, new_ids, expiry_type)
+                if not entry:
+                    self.send_json({"error":"Token not found"}); return
+                self.send_json({"ok":True, "token": entry})
+            except Exception as e:
+                self.send_json({"error":str(e)})
+            return
+
+        if p == "/admin/token/delete_all":
+            if not self.is_authed():
+                self.send_json({"error":"Not authenticated"}); return
+            TokenStore.delete_all()
+            self.send_json({"ok":True})
+            return
+
+        # ── User token fetch (no admin session needed — token is auth) ────
+        if p.startswith("/u/") and p.endswith("/fetch"):
+            token = p[3:-6]
+            ok, result = TokenStore.is_valid(token)
+            if not ok:
+                self.send_json({"error": result}); return
+            try:
+                payload = json.loads(self.body())
+                line    = payload.get("line","").strip()
+                limit   = int(payload.get("limit",20))
+                tok_data= result
+                acct_ids= tok_data.get("account_ids",[])
+                # Verify this line belongs to this token
+                all_accts = AccountStore.all()
+                token_lines = {a["line"] for a in all_accts if a.get("id") in acct_ids}
+                if line not in token_lines:
+                    self.send_json({"error":"Account not in your token"}); return
+                acct = parse_account_line(line)
+                if not acct:
+                    self.send_json({"error":"Invalid format"}); return
+                res, err = fetch_latest_otp(acct, limit)
+                if err:
+                    self.send_json({"error":err,"email":acct["email"]}); return
+                self.send_json({
+                    "email":   acct["email"], "uid": acct.get("uid",""),
+                    "otp":     res.get("otp"), "subject": res.get("subject",""),
+                    "sender":  res.get("sender",""), "date": res.get("date",""),
+                })
+            except Exception as e:
+                self.send_json({"error":str(e)})
+            return
+
         self.send_html("Not found",404)
 
 
@@ -1560,6 +2182,28 @@ textarea::placeholder{color:#ccc}
 
 /* Empty state */
 .empty{text-align:center;padding:50px 0;color:#bbb;font-size:13px;font-weight:700}
+
+/* Distribute */
+.dist-row{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin-bottom:12px;padding:12px;background:#f9fafc;border:1.5px solid #dde1ea;border-radius:10px}
+.dist-field{display:flex;flex-direction:column;gap:4px;flex:1;min-width:120px}
+.dist-field label{font-size:9px;color:#4455ff;letter-spacing:1.5px;font-weight:900;text-transform:uppercase}
+.dist-field input,.dist-field select{padding:8px 11px;background:#fff;border:2px solid #dde1ea;border-radius:7px;color:#1a1a2e;font-size:11.5px;font-family:inherit;font-weight:700;outline:none;transition:border-color .2s}
+.dist-field input:focus,.dist-field select:focus{border-color:#4455ff}
+.tok-tbl{width:100%;border-collapse:collapse;font-size:11px;margin-top:4px}
+.tok-tbl th{background:#f0f2ff;color:#4455ff;font-size:9px;letter-spacing:2px;text-transform:uppercase;padding:9px 11px;text-align:left;border-bottom:2px solid #dde1ea}
+.tok-tbl td{padding:10px 11px;border-bottom:1px solid #f0f1f6;vertical-align:middle}
+.tok-tbl tr:hover td{background:#fafbff}
+.tok-url{font-size:10.5px;color:#4455ff;font-weight:900;word-break:break-all;cursor:pointer;text-decoration:underline}
+.tok-name{font-weight:900;color:#1a1a2e;white-space:nowrap}
+.tok-exp-ok{color:#22aa66;font-size:10px;font-weight:900}
+.tok-exp-no{color:#cc3333;font-size:10px;font-weight:900}
+.tok-cnt{color:#4455ff;font-weight:900;font-size:13px}
+.tbtn{padding:4px 9px;border-radius:5px;font-size:9.5px;font-family:inherit;cursor:pointer;font-weight:900;transition:all .15s;white-space:nowrap;border:none}
+.tbtn-b{background:#eef0ff;color:#4455ff;border:1.5px solid #c0c8ff}.tbtn-b:hover{background:#4455ff;color:#fff}
+.tbtn-o{background:#fff8e6;color:#cc8800;border:1.5px solid #ffddaa}.tbtn-o:hover{background:#cc8800;color:#fff}
+.tbtn-r{background:#fff5f5;color:#cc3333;border:1.5px solid #ffcccc}.tbtn-r:hover{background:#cc3333;color:#fff}
+.tbtn-g{background:#e6fff3;color:#22aa66;border:1.5px solid #99ddbb}.tbtn-g:hover{background:#22aa66;color:#fff}
+.avail-badge{display:inline-block;padding:4px 12px;background:#e6fff3;border:1.5px solid #99ddbb;border-radius:8px;font-size:11px;color:#22aa66;font-weight:900;margin-bottom:10px}
 </style></head>
 <body>
 <header>
@@ -1629,6 +2273,55 @@ textarea::placeholder{color:#ccc}
     </div>
   </div>
 
+  <!-- ── DISTRIBUTE PANEL ─────────────────────────────────────── -->
+  <div class="panel">
+    <div class="panel-title">🔗 USER DISTRIBUTION — TOKEN MANAGER</div>
+    <div class="avail-badge" id="availBadge">⟳ Loading...</div>
+
+    <!-- Create new token -->
+    <div class="dist-row">
+      <div class="dist-field">
+        <label>User Name</label>
+        <input id="distName" type="text" placeholder="e.g. Ahmed / User 1">
+      </div>
+      <div class="dist-field" style="max-width:100px">
+        <label>Accounts #</label>
+        <input id="distCount" type="number" value="50" min="1" max="9999">
+      </div>
+      <div class="dist-field" style="max-width:150px">
+        <label>Expiry</label>
+        <select id="distExpiry">
+          <option value="48h">48 Hours</option>
+          <option value="7d">7 Days</option>
+          <option value="permanent">Permanent</option>
+        </select>
+      </div>
+      <div class="dist-field" style="max-width:140px">
+        <label>Order</label>
+        <select id="distShuffle">
+          <option value="1">Shuffle (Random)</option>
+          <option value="0">Sequential</option>
+        </select>
+      </div>
+      <button class="abtn abtn-green" onclick="createToken()" style="align-self:flex-end">➕ CREATE TOKEN</button>
+    </div>
+
+    <!-- Tokens table -->
+    <div style="overflow-x:auto">
+      <table class="tok-tbl">
+        <thead><tr>
+          <th>#</th><th>USER</th><th>ACC</th><th>EXPIRES</th><th>ACCESS URL (click to copy)</th><th>ACTIONS</th>
+        </tr></thead>
+        <tbody id="tokBody"></tbody>
+      </table>
+    </div>
+    <p class="empty" id="tokEmpty" style="display:none;padding:20px 0">No tokens yet. Create one above!</p>
+    <div class="row" style="margin-top:12px">
+      <button class="abtn abtn-red" onclick="deleteAllTokens()" style="font-size:10px">🗑️ DELETE ALL TOKENS</button>
+    </div>
+  </div>
+
+
 </div>
 <div class="toast" id="toast"></div>
 
@@ -1644,6 +2337,131 @@ function toast(msg, dur=2200){
   const t=document.getElementById('toast');
   t.textContent=msg; t.classList.add('show');
   setTimeout(()=>t.classList.remove('show'),dur);
+}
+
+
+// ── TOKEN MANAGER JS ──────────────────────────────────────────────────────────
+const SERVER_BASE = window.location.origin;
+
+async function loadTokens(){
+  try{
+    const r = await fetch('/admin/tokens').then(r=>r.json());
+    renderTokens(r.tokens||[]);
+    loadAvailableBadge();
+  } catch(e){ console.error('loadTokens error',e); }
+}
+
+async function loadAvailableBadge(){
+  try{
+    const [ar, tr] = await Promise.all([
+      fetch('/admin/list').then(r=>r.json()),
+      fetch('/admin/tokens').then(r=>r.json())
+    ]);
+    const total    = (ar.accounts||[]).length;
+    const tokens   = tr.tokens||[];
+    const assigned = new Set(tokens.flatMap(t=>t.account_ids||[]));
+    const avail    = total - assigned.size;
+    const badge    = document.getElementById('availBadge');
+    if(badge) badge.textContent = `📦 Total: ${total} · Assigned: ${assigned.size} · Available: ${avail}`;
+  } catch{}
+}
+
+function renderTokens(tokens){
+  const tbody = document.getElementById('tokBody');
+  const empty = document.getElementById('tokEmpty');
+  if(!tokens.length){ if(tbody) tbody.innerHTML=''; if(empty) empty.style.display='block'; return; }
+  if(empty) empty.style.display='none';
+
+  const now = new Date();
+  tbody.innerHTML = tokens.map((t,i)=>{
+    const url = `${SERVER_BASE}/u/${t.token}`;
+    let expHtml;
+    if(t.expiry_type==='permanent'){
+      expHtml = '<span class="tok-ok">∞ Permanent</span>';
+    } else {
+      try{
+        const exp = new Date(t.expires_at.replace(' ','T'));
+        const expired = now > exp;
+        const diffH   = Math.round((exp-now)/3600000);
+        expHtml = expired
+          ? '<span class="tok-ex">❌ EXPIRED</span>'
+          : `<span class="tok-ok">✅ ${diffH}h left<br><span style="font-size:9px;color:#aaa">${t.expires_at}</span></span>`;
+      } catch{ expHtml = t.expires_at||'—'; }
+    }
+    return `<tr id="tokrow_${t.token.slice(0,8)}">
+      <td style="color:#aaa;font-size:12px">${i+1}</td>
+      <td><b style="color:#1a1a2e">${esc(t.user_name)}</b><br><span style="font-size:9px;color:#aaa">${esc(t.created_at||'')}</span></td>
+      <td class="tok-cnt">${(t.account_ids||[]).length}</td>
+      <td>${expHtml}</td>
+      <td>
+        <span class="tok-url" onclick="copyTokUrl('${t.token}')" title="Click to copy">${url.slice(0,50)}...</span>
+      </td>
+      <td style="white-space:nowrap">
+        <button class="tbtn tbtn-b" onclick="copyTokUrl('${t.token}')">📋 URL</button>
+        <button class="tbtn tbtn-o" onclick="refreshToken('${t.token}')">🔄 REGEN</button>
+        <button class="tbtn tbtn-r" onclick="deleteToken('${t.token}')">🗑️ DEL</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+function copyTokUrl(token){
+  const url = `${SERVER_BASE}/u/${token}`;
+  navigator.clipboard.writeText(url).then(()=>toast('📋 URL copied: '+url, 2500));
+}
+
+async function createToken(){
+  const name   = document.getElementById('distName').value.trim() || 'User';
+  const count  = parseInt(document.getElementById('distCount').value)||50;
+  const expiry = document.getElementById('distExpiry').value;
+  const shuffle= document.getElementById('distShuffle').value === '1';
+
+  const r = await fetch('/admin/token/create',{
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({user_name:name, count, expiry_type:expiry, shuffle})
+  }).then(r=>r.json()).catch(e=>({error:e.message}));
+
+  if(r.error){ toast('❌ '+r.error, 3500); return; }
+
+  const url = `${SERVER_BASE}/u/${r.token.token}`;
+  toast(`✅ Token created! ${r.count} accounts for ${name}`, 3000);
+  // Auto-copy URL
+  navigator.clipboard.writeText(url).then(()=>toast('📋 URL auto-copied! Share with '+name, 3000));
+  document.getElementById('distName').value='';
+  await loadTokens();
+}
+
+async function refreshToken(token){
+  const newCount = prompt('New account count? (leave empty = keep same)');
+  let count = null;
+  if(newCount && newCount.trim()) count = parseInt(newCount.trim());
+
+  const r = await fetch('/admin/token/refresh',{
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({token, count})
+  }).then(r=>r.json()).catch(e=>({error:e.message}));
+
+  if(r.error){ toast('❌ '+r.error); return; }
+  const url = `${SERVER_BASE}/u/${r.token.token}`;
+  navigator.clipboard.writeText(url).then(()=>toast('✅ Token regenerated! New URL copied', 3000));
+  await loadTokens();
+}
+
+async function deleteToken(token){
+  if(!confirm('Delete this token? User ka access band ho jayega.')) return;
+  const r = await fetch('/admin/token/delete',{
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({token})
+  }).then(r=>r.json());
+  if(r.ok){ toast('🗑️ Token deleted'); await loadTokens(); }
+  else toast('❌ '+r.error);
+}
+
+async function deleteAllTokens(){
+  if(!confirm('ALL tokens delete karo? Saare users ka access band ho jayega!')) return;
+  await fetch('/admin/token/delete_all',{method:'POST'});
+  toast('🗑️ All tokens deleted');
+  await loadTokens();
 }
 
 // ── Load accounts from server ─────────────────────────────────────────────────
@@ -1808,9 +2626,505 @@ function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;')
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 loadAccounts();
+loadTokens();
 </script>
 </body></html>"""
 
+
+USER_HTML = r"""<!DOCTYPE html>
+<html><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OTP Reader — __USER_NAME__</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#f0f2f8;color:#1a1a2e;font-family:'Courier New',monospace;font-weight:700;min-height:100vh}
+header{background:#1a1a2e;padding:14px 24px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
+.brand{color:#fff;font-size:15px;font-weight:900;letter-spacing:3px}
+.user-badge{background:#22aa66;color:#fff;padding:5px 14px;border-radius:20px;font-size:11px;font-weight:900;letter-spacing:1px}
+.exp-badge{font-size:10px;color:#aaa;font-weight:700;letter-spacing:1px}
+.wrap{max-width:1000px;margin:0 auto;padding:20px 16px}
+.panel{background:#fff;border:2px solid #dde1ea;border-radius:14px;padding:20px;margin-bottom:16px;box-shadow:0 2px 12px rgba(0,0,0,.05)}
+.panel-title{color:#4455ff;font-size:10px;letter-spacing:3px;font-weight:900;margin-bottom:14px}
+.btn{padding:10px 20px;background:#4455ff;border:none;border-radius:8px;color:#fff;font-size:11px;font-family:inherit;cursor:pointer;font-weight:900;letter-spacing:1px;transition:background .2s;white-space:nowrap}
+.btn:hover{background:#3344dd}
+.btn-green{background:#22aa66}.btn-green:hover{background:#1a8850}
+.btn-red{background:#cc3333}.btn-red:hover{background:#aa2222}
+.btn-sm{padding:6px 12px;font-size:10px}
+.btn-gold{background:#cc8800}.btn-gold:hover{background:#aa6600}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+select{padding:8px 12px;background:#f9fafc;border:2px solid #dde1ea;border-radius:8px;color:#1a1a2e;font-size:11px;font-family:inherit;font-weight:900;outline:none}
+.prog-wrap{background:#fff;border:2px solid #dde1ea;border-radius:12px;padding:14px 18px;margin-bottom:14px}
+.prog-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.prog-label{color:#4455ff;font-size:11px;font-weight:900;letter-spacing:2px}
+.prog-nums{color:#1a1a2e;font-size:13px;font-weight:900}
+.prog-bar-bg{background:#eef0ff;border-radius:8px;height:8px;overflow:hidden}
+.prog-bar{background:linear-gradient(90deg,#4455ff,#22aa66);height:8px;border-radius:8px;transition:width .4s ease;width:0%}
+.prog-status{color:#666;font-size:10px;margin-top:6px;font-weight:700}
+.summary{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.chip{padding:6px 14px;border-radius:20px;font-size:10px;font-weight:900}
+.chip-blue{background:#eef0ff;color:#4455ff;border:2px solid #c0c8ff}
+.chip-green{background:#e6fff3;color:#22aa66;border:2px solid #99ddbb}
+.chip-red{background:#fff5f5;color:#cc3333;border:2px solid #ffcccc}
+.chip-grey{background:#f5f6fa;color:#666;border:2px solid #dde1ea}
+.tbl-wrap{background:#fff;border:2px solid #dde1ea;border-radius:12px;overflow:hidden}
+.tbl-head{display:grid;grid-template-columns:40px minmax(100px,1fr) minmax(150px,1.5fr) 110px 90px 120px;background:#f0f2ff;border-bottom:2px solid #dde1ea;padding:9px 14px;font-size:9px;color:#4455ff;letter-spacing:2px;font-weight:900}
+.row-item{display:grid;grid-template-columns:40px minmax(100px,1fr) minmax(150px,1.5fr) 110px 90px 120px;padding:10px 14px;border-bottom:1.5px solid #f0f1f6;align-items:center;gap:4px}
+.row-item:last-child{border-bottom:none}
+.row-item:hover{background:#fafbff}
+.num-c{color:#aaa;font-size:12px;font-weight:900}
+.uid-c{font-size:11px;font-weight:900;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.email-c{font-size:11px;color:#555;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.otp-c{font-size:18px;font-weight:900;color:#4455ff;letter-spacing:3px;cursor:pointer}
+.otp-none{color:#ccc;font-size:12px;font-weight:900}
+.otp-err{color:#cc3333;font-size:9px;word-break:break-all}
+.st{display:inline-block;padding:3px 8px;border-radius:10px;font-size:9px;font-weight:900;white-space:nowrap}
+.st-pending{background:#f5f6fa;color:#bbb;border:1.5px solid #dde1ea}
+.st-fetching{background:#fff8e6;color:#cc8800;border:1.5px solid #ffddaa}
+.st-found{background:#e6fff3;color:#22aa66;border:1.5px solid #99ddbb}
+.st-none{background:#f5f6fa;color:#999;border:1.5px solid #dde1ea}
+.st-err{background:#fff5f5;color:#cc3333;border:1.5px solid #ffcccc}
+.act-c{display:flex;flex-direction:column;gap:4px}
+.cb{padding:3px 8px;border-radius:5px;font-size:9px;font-family:inherit;cursor:pointer;font-weight:900;border:1.5px solid;transition:all .15s;white-space:nowrap}
+.cb-otp{background:#eef0ff;border-color:#c0c8ff;color:#4455ff}
+.cb-otp:hover{background:#4455ff;color:#fff}
+.cb-uid{background:#fff8e6;border-color:#ffddaa;color:#cc8800}
+.cb-uid:hover{background:#cc8800;color:#fff}
+.cb-otp:disabled,.cb-uid:disabled{background:#f5f6fa;border-color:#eee;color:#ccc;cursor:default}
+.toast{position:fixed;bottom:20px;right:20px;background:#1a1a2e;color:#fff;padding:11px 20px;border-radius:10px;font-size:12px;font-weight:900;opacity:0;transition:opacity .3s;pointer-events:none;z-index:999}
+.toast.show{opacity:1}
+@media(max-width:600px){
+  .tbl-head,.row-item{grid-template-columns:30px 1fr 80px 60px}
+  .email-col,.subj-col{display:none}
+  .wrap{padding:14px 10px}
+}
+</style></head>
+<body>
+<header>
+  <span class="brand">🔐 OTP READER</span>
+  <div style="display:flex;align-items:center;gap:12px">
+    <span class="user-badge">👤 __USER_NAME__</span>
+    <span class="exp-badge">__EXP_LABEL__</span>
+  </div>
+</header>
+<div class="wrap">
+
+  <div class="panel">
+    <div class="panel-title">⚡ FETCH OTPs — YOUR __ACC_COUNT__ ACCOUNTS</div>
+    <div class="row">
+      <select id="lm">
+        <option value="10">Last 10 emails</option>
+        <option value="20" selected>Last 20 emails</option>
+        <option value="50">Last 50 emails</option>
+      </select>
+      <button class="btn btn-green" id="fetchAllBtn" onclick="fetchAll()">⚡ FETCH ALL OTPs</button>
+      <button class="btn btn-gold btn-sm" onclick="copyAllUid()">👥 COPY ALL UID|PASS</button>
+      <button class="btn btn-sm" onclick="copyAllOtp()">📋 COPY ALL OTPs</button>
+    </div>
+  </div>
+
+  <div class="prog-wrap" id="progWrap" style="display:none">
+    <div class="prog-top">
+      <span class="prog-label">⚡ FETCHING...</span>
+      <span class="prog-nums" id="progNums">0 / 0</span>
+    </div>
+    <div class="prog-bar-bg"><div class="prog-bar" id="progBar"></div></div>
+    <div class="prog-status" id="progStatus">Starting...</div>
+  </div>
+
+  <div class="summary" id="summaryBar" style="display:none"></div>
+
+  <div class="tbl-wrap">
+    <div class="tbl-head">
+      <div>#</div><div>UID</div><div class="email-col">EMAIL</div>
+      <div>LATEST OTP</div><div>STATUS</div><div>ACTION</div>
+    </div>
+    <div id="tableBody"></div>
+  </div>
+
+</div>
+<div class="toast" id="toast"></div>
+<script>
+const TOKEN    = '__TOKEN__';
+const accounts = __ACCOUNTS_JSON__;
+let results    = {};
+let isFetching = false, stopFlag = false;
+
+function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function toast(m,d=2000){ const t=document.getElementById('toast'); t.textContent=m; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),d); }
+function cp(txt,lbl){ navigator.clipboard.writeText(txt).then(()=>toast('📋 COPIED: '+(lbl||txt))); }
+
+// Build table
+document.getElementById('tableBody').innerHTML = accounts.map((a,i)=>`
+  <div class="row-item" id="row_${i}">
+    <div class="num-c">${i+1}</div>
+    <div class="uid-c" title="${esc(a.uid)}">${a.uid||'<span style="color:#ccc">—</span>'}</div>
+    <div class="email-c email-col" title="${esc(a.email)}">${esc(a.email)}</div>
+    <div id="otp_${i}" class="otp-none">—</div>
+    <div><span class="st st-pending" id="st_${i}">PENDING</span></div>
+    <div class="act-c">
+      <button class="cb cb-otp" id="copybtn_${i}" disabled onclick="cpOTP(${i})">📋 COPY OTP</button>
+      <button class="cb cb-uid" ${a.uid?'':'disabled'} onclick="cpUID(${i})">👤 UID|PASS</button>
+    </div>
+  </div>`).join('');
+
+function setSt(i,type,lbl){
+  const el=document.getElementById('st_'+i);
+  if(el){ el.className='st st-'+type; el.textContent=lbl; }
+}
+function setOTP(i,otp,err){
+  const el=document.getElementById('otp_'+i);
+  const cb=document.getElementById('copybtn_'+i);
+  if(otp){ el.className='otp-c'; el.textContent=otp; el.onclick=()=>cpOTP(i); if(cb)cb.disabled=false; }
+  else if(err){ el.className='otp-err'; el.textContent=err.slice(0,80); el.onclick=null; }
+  else { el.className='otp-none'; el.textContent='—'; el.onclick=null; }
+}
+
+async function fetchAll(){
+  if(isFetching){ stopFlag=true; return; }
+  isFetching=true; stopFlag=false; results={};
+  const btn=document.getElementById('fetchAllBtn');
+  btn.textContent='⏹ STOP'; btn.style.background='#cc3333';
+  document.getElementById('progWrap').style.display='block';
+  const limit=parseInt(document.getElementById('lm').value);
+  let done=0;
+  for(let i=0;i<accounts.length;i++){
+    if(stopFlag) break;
+    const a=accounts[i];
+    setSt(i,'fetching','⏳ FETCHING');
+    document.getElementById('progNums').textContent=`${done}/${accounts.length}`;
+    document.getElementById('progBar').style.width=`${Math.round(done/accounts.length*100)}%`;
+    document.getElementById('progStatus').textContent=`Fetching: ${a.email}`;
+    try{
+      const res=await fetch('/u/fetch',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({token:TOKEN,line:a.line,limit})
+      }).then(r=>r.json());
+      results[i]=res;
+      if(res.error){ setSt(i,'err','❌ ERROR'); setOTP(i,null,res.error); }
+      else if(res.otp){ setSt(i,'found','✅ FOUND'); setOTP(i,res.otp,null); }
+      else { setSt(i,'none','📭 NO OTP'); setOTP(i,null,null); }
+    } catch(e){ results[i]={error:e.message}; setSt(i,'err','❌ ERR'); setOTP(i,null,e.message); }
+    done++;
+  }
+  document.getElementById('progNums').textContent=`${done}/${accounts.length}`;
+  document.getElementById('progBar').style.width=stopFlag?document.getElementById('progBar').style.width:'100%';
+  document.getElementById('progStatus').textContent=stopFlag?`⏹ Stopped at ${done}`:`✅ Done! ${done} processed`;
+  isFetching=false; btn.textContent='⚡ FETCH ALL OTPs'; btn.style.background='#22aa66';
+  updateSummary();
+}
+
+function updateSummary(){
+  const total=accounts.length, found=Object.values(results).filter(r=>r.otp).length;
+  const noOtp=Object.values(results).filter(r=>!r.error&&!r.otp).length;
+  const err=Object.values(results).filter(r=>r.error).length;
+  const bar=document.getElementById('summaryBar');
+  bar.style.display='flex';
+  bar.innerHTML=`<div class="chip chip-blue">📋 TOTAL: ${total}</div><div class="chip chip-green">✅ FOUND: ${found}</div><div class="chip chip-grey">📭 NO OTP: ${noOtp}</div><div class="chip chip-red">❌ ERR: ${err}</div>`;
+}
+
+function cpOTP(i){ const r=results[i]; if(r&&r.otp) cp(r.otp,'OTP '+r.otp); }
+function cpUID(i){
+  const a=accounts[i]; if(!a||!a.uid) return;
+  const p=a.line.split('|'); const pass=p.length>=5?p[1].trim():p.length>=2?p[1].trim():'';
+  cp(a.uid+'|'+pass,'UID|PASS');
+}
+function copyAllUid(){
+  const lines=accounts.map(a=>{const p=a.line.split('|');const uid=a.uid||(p.length>=5?p[0].trim():'');const pass=p.length>=5?p[1].trim():p.length>=2?p[1].trim():'';return uid&&pass?uid+'|'+pass:null;}).filter(Boolean);
+  if(!lines.length){toast('❌ No UID|PASS');return;}
+  navigator.clipboard.writeText(lines.join('\n')).then(()=>toast(`✅ ${lines.length} UID|PASS copied!`));
+}
+function copyAllOtp(){
+  const lines=Object.values(results).filter(r=>r.otp).map(r=>r.otp);
+  if(!lines.length){toast('❌ No OTPs yet — fetch first');return;}
+  navigator.clipboard.writeText(lines.join('\n')).then(()=>toast(`✅ ${lines.length} OTPs copied!`));
+}
+</script>
+</body></html>"""
+
+
+USER_HTML = """<!DOCTYPE html>
+<html><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OTP Reader — __USER_NAME__</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#f0f2f8;color:#1a1a2e;font-family:'Courier New',monospace;font-weight:700;min-height:100vh}
+header{background:#fff;border-bottom:2px solid #dde1ea;padding:13px 22px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100;box-shadow:0 2px 8px rgba(0,0,0,.06)}
+.brand{font-size:14px;font-weight:900;letter-spacing:3px;color:#1a1a2e}
+.hinfo{font-size:10px;color:#888;font-weight:700;text-align:right;line-height:1.7}
+.wrap{max-width:1060px;margin:0 auto;padding:20px 14px}
+.panel{background:#fff;border:2px solid #dde1ea;border-radius:14px;padding:18px 22px;margin-bottom:16px;box-shadow:0 2px 10px rgba(0,0,0,.05)}
+.ptitle{color:#4455ff;font-size:10px;letter-spacing:3px;font-weight:900;margin-bottom:12px;text-transform:uppercase}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}
+select{padding:8px 12px;background:#f9fafc;border:2px solid #dde1ea;border-radius:7px;color:#1a1a2e;font-size:11px;font-family:inherit;font-weight:900;outline:none}
+.btn{padding:10px 20px;background:#4455ff;border:none;border-radius:8px;color:#fff;font-size:11px;font-family:inherit;cursor:pointer;letter-spacing:1.5px;font-weight:900;transition:background .2s;white-space:nowrap}
+.btn:hover{background:#3344dd}.btn:disabled{background:#aab;cursor:not-allowed}
+.btn-g{background:#22aa66}.btn-g:hover{background:#1a8850}
+.btn-o{background:#cc8800}.btn-o:hover{background:#aa6600}
+.btn-r{background:#cc3333}.btn-r:hover{background:#aa2222}
+.btn-sm{padding:6px 12px;font-size:10px}
+.prog-wrap{background:#fff;border:2px solid #dde1ea;border-radius:12px;padding:14px 18px;margin-bottom:14px}
+.prog-bar-bg{background:#eef0ff;border-radius:8px;height:8px;overflow:hidden;margin-top:8px}
+.prog-bar{background:linear-gradient(90deg,#4455ff,#22aa66);height:8px;border-radius:8px;transition:width .4s;width:0%}
+.prog-info{display:flex;justify-content:space-between;font-size:10px;color:#888;margin-top:5px}
+.summary{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.chip{padding:6px 14px;border-radius:18px;font-size:10.5px;font-weight:900}
+.chip-b{background:#eef0ff;color:#4455ff;border:1.5px solid #c0c8ff}
+.chip-g{background:#e6fff3;color:#22aa66;border:1.5px solid #99ddbb}
+.chip-r{background:#fff5f5;color:#cc3333;border:1.5px solid #ffcccc}
+.chip-gr{background:#f5f6fa;color:#666;border:1.5px solid #dde1ea}
+.tbl-wrap{background:#fff;border:2px solid #dde1ea;border-radius:14px;overflow:hidden}
+.tbl-head,.row-item{display:grid;grid-template-columns:38px 52px minmax(120px,1fr) 110px minmax(100px,1.2fr) 82px 128px;padding:10px 13px;align-items:center;gap:4px}
+.tbl-head{background:#f0f2ff;border-bottom:2px solid #dde1ea;font-size:9px;color:#4455ff;letter-spacing:2px;font-weight:900;text-transform:uppercase}
+.row-item{border-bottom:1.5px solid #f0f1f6;transition:background .15s}
+.row-item:last-child{border-bottom:none}.row-item:hover{background:#fafbff}
+.num-c{color:#aaa;font-size:12px}.uid-c{font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.email-c{font-size:11px;color:#333;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.otp-c{font-size:18px;font-weight:900;color:#4455ff;letter-spacing:3px;cursor:pointer}
+.otp-c:hover{color:#2233bb}.otp-none{color:#ccc;font-size:12px}.otp-err{color:#cc3333;font-size:9px;word-break:break-all}
+.subj-c{color:#666;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.date-c{color:#999;font-size:10px}
+.act-c{display:flex;flex-direction:column;gap:4px}
+.fb{padding:4px 9px;border:2px solid #99ddbb;border-radius:6px;background:#e6fff3;color:#22aa66;font-size:9px;font-family:inherit;cursor:pointer;font-weight:900;transition:all .15s;white-space:nowrap}
+.fb:hover{background:#22aa66;color:#fff}.fb:disabled{background:#f5f6fa;border-color:#dde1ea;color:#ccc;cursor:default}
+.cb{padding:4px 9px;border:2px solid #c0c8ff;border-radius:6px;background:#eef0ff;color:#4455ff;font-size:9px;font-family:inherit;cursor:pointer;font-weight:900;transition:all .15s;white-space:nowrap}
+.cb:hover{background:#4455ff;color:#fff}.cb:disabled{background:#f5f6fa;border-color:#dde1ea;color:#ccc;cursor:default}
+.ub{padding:4px 9px;border:2px solid #ffddaa;border-radius:6px;background:#fff8e6;color:#cc8800;font-size:9px;font-family:inherit;cursor:pointer;font-weight:900;transition:all .15s;white-space:nowrap}
+.ub:hover{background:#cc8800;color:#fff}.ub:disabled{background:#f5f6fa;border-color:#dde1ea;color:#ccc;cursor:default}
+.st{display:inline-block;padding:3px 8px;border-radius:9px;font-size:9px;font-weight:900;text-transform:uppercase;white-space:nowrap}
+.st-p{background:#f5f6fa;color:#bbb;border:1.5px solid #dde1ea}
+.st-f{background:#fff8e6;color:#cc8800;border:1.5px solid #ffddaa}
+.st-ok{background:#e6fff3;color:#22aa66;border:1.5px solid #99ddbb}
+.st-no{background:#f5f6fa;color:#999;border:1.5px solid #dde1ea}
+.st-e{background:#fff5f5;color:#cc3333;border:1.5px solid #ffcccc}
+.toast{position:fixed;bottom:18px;right:18px;background:#1a1a2e;color:#fff;padding:10px 20px;border-radius:10px;font-size:11px;font-weight:900;opacity:0;transition:opacity .3s;pointer-events:none;z-index:999}
+.toast.show{opacity:1}
+.bulk-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;padding:10px;background:#f0f2ff;border-radius:8px;border:1.5px solid #c0c8ff}
+@media(max-width:650px){.tbl-head,.row-item{grid-template-columns:28px 38px 1fr 90px 80px;}.subj-c,.date-c{display:none}}
+</style></head>
+<body>
+<header>
+  <span class="brand">🔐 OTP READER</span>
+  <div class="hinfo">
+    👤 <b>__USER_NAME__</b><br>
+    📋 __ACC_COUNT__ accounts &nbsp;·&nbsp; ⏰ Expires: __EXPIRES__
+  </div>
+</header>
+<div class="wrap">
+
+  <div class="panel">
+    <div class="ptitle">⚡ YOUR ACCOUNTS — __ACC_COUNT__ total</div>
+    <div class="row">
+      <select id="lm">
+        <option value="10">Last 10 emails</option>
+        <option value="20" selected>Last 20 emails</option>
+        <option value="50">Last 50 emails</option>
+        <option value="100">Last 100 emails</option>
+      </select>
+      <button class="btn btn-g" id="fetchAllBtn" onclick="fetchAll()">⚡ FETCH ALL OTPs</button>
+      <button class="btn btn-sm" style="background:#555" onclick="stopFetch()">⏹ STOP</button>
+    </div>
+    <div class="bulk-row" style="margin-top:10px">
+      <span style="font-size:10px;color:#4455ff;font-weight:900;align-self:center">BULK COPY:</span>
+      <button class="btn btn-sm btn-o" onclick="copyAllUID()">👥 ALL UID|PASS</button>
+      <button class="btn btn-sm btn-g" onclick="copyAllOTP()">📋 ALL OTPs</button>
+      <button class="btn btn-sm btn-o" onclick="copyFoundUID()">👥 FOUND UID|PASS</button>
+      <button class="btn btn-sm btn-g" onclick="copyFoundOTP()">📋 FOUND OTPs ONLY</button>
+    </div>
+  </div>
+
+  <div class="prog-wrap" id="progWrap" style="display:none">
+    <div style="display:flex;justify-content:space-between"><span style="font-size:11px;color:#4455ff;font-weight:900">⚡ FETCHING...</span><span id="progNums" style="font-size:12px;font-weight:900">0/0</span></div>
+    <div class="prog-bar-bg"><div class="prog-bar" id="progBar"></div></div>
+    <div class="prog-info"><span id="progStatus">Starting...</span></div>
+  </div>
+
+  <div class="summary" id="summaryBar" style="display:none"></div>
+
+  <div class="tbl-wrap">
+    <div class="tbl-head">
+      <div>#</div><div>UID</div><div>EMAIL</div><div>LATEST OTP</div><div>SUBJECT</div><div>DATE</div><div>ACTION</div>
+    </div>
+    <div id="tableBody"></div>
+  </div>
+
+</div>
+<div class="toast" id="toast"></div>
+<script>
+const TOKEN     = "__TOKEN__";
+const RAW_LINES = __LINES_JSON__;
+
+let accounts  = RAW_LINES.map((line,i)=>{
+  const p = line.split('|');
+  let uid='',email='';
+  if(p.length>=5 && !p[0].includes('@')){ uid=p[0].trim(); email=p[2].trim(); }
+  else { email=p[0].trim(); }
+  return {idx:i, uid, email, line};
+});
+let results   = {};
+let isFetching= false;
+let stopFlag  = false;
+
+function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function toast(msg,dur=2200){
+  const t=document.getElementById('toast');
+  t.textContent=msg;t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'),dur);
+}
+
+// ── Build table ───────────────────────────────────────────────────────
+function buildTable(){
+  document.getElementById('tableBody').innerHTML = accounts.map(a=>`
+    <div class="row-item" id="row_${a.idx}">
+      <div class="num-c">${a.idx+1}</div>
+      <div class="uid-c" title="${esc(a.uid)}">${a.uid?esc(a.uid):'<span style="color:#ccc">—</span>'}</div>
+      <div class="email-c" title="${esc(a.email)}">${esc(a.email)}</div>
+      <div id="otp_${a.idx}" class="otp-none">—</div>
+      <div id="subj_${a.idx}" class="subj-c"></div>
+      <div id="date_${a.idx}" class="date-c"></div>
+      <div class="act-c">
+        <button class="fb" id="fb_${a.idx}" onclick="fetchOne(${a.idx})">⚡ FETCH</button>
+        <button class="cb" id="cb_${a.idx}" disabled onclick="copyOTP(${a.idx})">📋 COPY OTP</button>
+        <button class="ub" id="ub_${a.idx}" ${a.uid?'':'disabled'} onclick="copyUID(${a.idx})">👤 UID|PASS</button>
+        <span class="st st-p" id="st_${a.idx}">PENDING</span>
+      </div>
+    </div>`).join('');
+}
+buildTable();
+
+// ── Fetch helpers ─────────────────────────────────────────────────────
+function setStatus(idx,type,label){
+  const el=document.getElementById('st_'+idx);
+  if(el){el.className='st st-'+type;el.textContent=label;}
+}
+
+function setOTP(idx,otp,err,subj,date){
+  const oe=document.getElementById('otp_'+idx);
+  const se=document.getElementById('subj_'+idx);
+  const de=document.getElementById('date_'+idx);
+  const cb=document.getElementById('cb_'+idx);
+  if(otp){
+    if(oe){oe.className='otp-c';oe.textContent=otp;oe.onclick=()=>copyOTP(idx);}
+    if(cb) cb.disabled=false;
+  } else if(err){
+    if(oe){oe.className='otp-err';oe.textContent=err.slice(0,80);oe.onclick=null;}
+  } else {
+    if(oe){oe.className='otp-none';oe.textContent='—';oe.onclick=null;}
+  }
+  if(se) se.textContent=subj||'';
+  if(de) de.textContent=date||'';
+}
+
+async function fetchOne(idx){
+  const a=accounts[idx]; if(!a) return;
+  const fb=document.getElementById('fb_'+idx);
+  if(fb){fb.disabled=true;fb.textContent='⏳';}
+  setStatus(idx,'f','⏳ FETCHING');
+  const limit=parseInt(document.getElementById('lm').value);
+  try{
+    const res=await fetch('/u/'+TOKEN+'/fetch',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({line:a.line,limit})
+    }).then(r=>r.json());
+    results[idx]=res;
+    if(res.error){setStatus(idx,'e','❌ ERR');setOTP(idx,null,res.error,'','');}
+    else if(res.otp){setStatus(idx,'ok','✅ FOUND');setOTP(idx,res.otp,'',res.subject||'',res.date||'');}
+    else{setStatus(idx,'no','📭 NO OTP');setOTP(idx,null,'','','');}
+  } catch(e){
+    results[idx]={error:e.message};
+    setStatus(idx,'e','❌ ERR');setOTP(idx,null,e.message,'','');
+  }
+  if(fb){fb.disabled=false;fb.textContent='⚡ FETCH';}
+  updateSummary();
+}
+
+async function fetchAll(){
+  if(isFetching) return;
+  isFetching=true; stopFlag=false;
+  document.getElementById('progWrap').style.display='block';
+  const progBar=document.getElementById('progBar');
+  const progNums=document.getElementById('progNums');
+  const progStatus=document.getElementById('progStatus');
+  let done=0;
+  for(const a of accounts){
+    if(stopFlag) break;
+    setStatus(a.idx,'f','⏳');
+    progStatus.textContent='Fetching: '+a.email+' ('+(done+1)+'/'+accounts.length+')';
+    progNums.textContent=done+'/'+accounts.length;
+    progBar.style.width=(done/accounts.length*100)+'%';
+    await fetchOne(a.idx);
+    done++;
+  }
+  progBar.style.width=stopFlag?progBar.style.width:'100%';
+  progNums.textContent=done+'/'+accounts.length;
+  progStatus.textContent=(stopFlag?'⏹ Stopped':'✅ Done!')+' — '+done+' processed';
+  isFetching=false;
+  updateSummary();
+}
+
+function stopFetch(){ stopFlag=true; isFetching=false; }
+
+// ── Copy functions ────────────────────────────────────────────────────
+function copyOTP(idx){
+  const r=results[idx]; if(r&&r.otp) navigator.clipboard.writeText(r.otp).then(()=>toast('📋 OTP copied: '+r.otp));
+}
+function copyUID(idx){
+  const a=accounts[idx]; if(!a) return;
+  const p=a.line.split('|');
+  const pass=p.length>=5?p[1].trim():(p.length>=2?p[1].trim():'');
+  if(!a.uid||!pass){toast('❌ UID or PASS missing');return;}
+  navigator.clipboard.writeText(a.uid+'|'+pass).then(()=>toast('📋 UID|PASS copied!'));
+}
+function copyAllUID(){
+  const lines=accounts.map(a=>{
+    const p=a.line.split('|');
+    const uid=a.uid||(p.length>=5?p[0].trim():'');
+    const pass=p.length>=5?p[1].trim():(p.length>=2?p[1].trim():'');
+    return uid&&pass?uid+'|'+pass:null;
+  }).filter(Boolean);
+  if(!lines.length){toast('❌ Koi UID|PASS nahi');return;}
+  navigator.clipboard.writeText(lines.join('\\n')).then(()=>toast('✅ '+lines.length+' UID|PASS copied!'));
+}
+function copyAllOTP(){
+  const lines=accounts.map(a=>{const r=results[a.idx];return r&&r.otp?r.otp:null;}).filter(Boolean);
+  if(!lines.length){toast('❌ OTP nahi mila — pehle FETCH karo');return;}
+  navigator.clipboard.writeText(lines.join('\\n')).then(()=>toast('✅ '+lines.length+' OTPs copied!'));
+}
+function copyFoundUID(){
+  const lines=accounts.filter(a=>results[a.idx]&&results[a.idx].otp).map(a=>{
+    const p=a.line.split('|');
+    const uid=a.uid||(p.length>=5?p[0].trim():'');
+    const pass=p.length>=5?p[1].trim():'';
+    return uid&&pass?uid+'|'+pass:null;
+  }).filter(Boolean);
+  if(!lines.length){toast('❌ OTP found accounts ka UID|PASS nahi mila');return;}
+  navigator.clipboard.writeText(lines.join('\\n')).then(()=>toast('✅ '+lines.length+' Found UID|PASS copied!'));
+}
+function copyFoundOTP(){
+  const lines=accounts.filter(a=>results[a.idx]&&results[a.idx].otp).map(a=>results[a.idx].otp);
+  if(!lines.length){toast('❌ Koi OTP found nahi');return;}
+  navigator.clipboard.writeText(lines.join('\\n')).then(()=>toast('✅ '+lines.length+' Found OTPs copied!'));
+}
+
+// ── Summary ───────────────────────────────────────────────────────────
+function updateSummary(){
+  const total=accounts.length;
+  const found=Object.values(results).filter(r=>r.otp).length;
+  const noOTP=Object.values(results).filter(r=>!r.error&&!r.otp).length;
+  const err=Object.values(results).filter(r=>r.error).length;
+  const pend=total-found-noOTP-err;
+  const bar=document.getElementById('summaryBar');
+  bar.style.display='flex';
+  bar.innerHTML=
+    '<div class="chip chip-b">📋 TOTAL: '+total+'</div>'+
+    '<div class="chip chip-g">✅ FOUND: '+found+'</div>'+
+    '<div class="chip chip-gr">📭 NO OTP: '+noOTP+'</div>'+
+    '<div class="chip chip-r">❌ ERR: '+err+'</div>'+
+    (pend>0?'<div class="chip chip-gr">⏳ PENDING: '+pend+'</div>':'');
+}
+updateSummary();
+</script>
+</body></html>"""
 
 port = 5000   # global — used in do_GET for URL injection
 
