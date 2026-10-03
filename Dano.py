@@ -65,107 +65,86 @@ def open_whatsapp():
         os.system(f"xdg-open '{wa_url}' > /dev/null 2>&1")
 
 def check_key():
-    os.system("clear")
-
-    saved_key_file = os.path.join(
-        "/data/data/com.termux/files/home",
-        ".ahb_key.txt"
-    )
+    os.system('clear')
+    
+    # اینڈرائیڈ پاتھ فکس لاجک (علی خان ٹول کی طرح پکا سیونگ پاتھ)
+    try:
+        import pathlib
+        home_dir = str(pathlib.Path.home())
+        saved_key_file = os.path.join(home_dir, ".ahb_key.txt")
+    except:
+        saved_key_file = "/data/data/com.termux/files/home/.ahb_key.txt"
+        
     user_hwid = get_hwid()
-
-    user_key = None
+    
     if os.path.exists(saved_key_file):
         try:
             with open(saved_key_file, "r") as f:
                 user_key = f.read().strip().upper()
             if user_key:
-                print("\033[1;32m[•] Auto-logging in with saved key...\033[0m")
-        except Exception:
+                print(f'\033[1;32m[•] Auto-logging in with saved key...\033[0m')
+            else:
+                user_key = None
+        except:
             user_key = None
-
+    else:
+        user_key = None
     if not user_key:
-        print("[!] Welcome! Please enter your key for first-time activation.")
+        print('[!] Welcome! Please enter your key for first-time activation.')
+        print('''
+\033[1;31m╔════════════════════════════════════╗
+║ 🎉 NEW USERS GET 2 DAYS 🎉         ║
+║       FREE APPROVAL                ║
+╚════════════════════════════════════╝\033[0m
+''')
+        open_whatsapp()
         user_key = input("[?] Enter Your Key: ").strip().upper()
-
     try:
-        res = requests.get(
-            f"{FIREBASE_URL}keys/{user_key}.json",
-            timeout=10
-        )
-        res.raise_for_status()
+        res = requests.get(f"{FIREBASE_URL}keys/{user_key}.json", timeout=10)
         key_data = res.json()
-
-        if not isinstance(key_data, dict):
-            print("\033[1;31m[×] Invalid Key!\033[0m")
-            if os.path.exists(saved_key_file):
-                os.remove(saved_key_file)
-            sys.exit()
-
-        # Manual revoke support: status must be active.
-        status = str(key_data.get("status") or "active").strip().lower()
-        if status != "active":
-            print("\033[1;31m[×] License Revoked!\033[0m")
-            if os.path.exists(saved_key_file):
-                os.remove(saved_key_file)
-            sys.exit()
-
-        # Expiry: Lifetime or YYYY-MM-DD. Never compare None with a string.
-        expiry_str = key_data.get("expiry")
-        if not expiry_str:
-            print("\033[1;31m[×] License expiry is missing!\033[0m")
-            sys.exit()
-
-        if str(expiry_str).strip().lower() != "lifetime":
+        if key_data and isinstance(key_data, dict):
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            expiry_str = key_data.get('expiry')
+            
+            if expiry_str != "Lifetime":
+                try:
+                    t_date = datetime.strptime(today_str, "%Y-%m-%d")
+                    e_date = datetime.strptime(expiry_str, "%Y-%m-%d")
+                    if e_date < t_date:
+                        print('\n\033[1;31m[×] Status: Key Expired!\033[0m')
+                        if os.path.exists(saved_key_file): os.remove(saved_key_file)
+                        sys.exit()
+                except:
+                    if expiry_str < today_str:
+                        print('\n\033[1;31m[×] Status: Key Expired!\033[0m')
+                        if os.path.exists(saved_key_file): os.remove(saved_key_file)
+                        sys.exit()
+                        
+            saved_hwid = key_data.get('hwid')
+            if saved_hwid == "None" or saved_hwid == "":
+                requests.patch(f"{FIREBASE_URL}keys/{user_key}.json", json={'hwid': user_hwid})
+            elif saved_hwid != user_hwid:
+                print('\n\033[1;31m[×] Security Alert: Key dusri device par chal rahi hai!\033[0m')
+                sys.exit()
+                
+            # کی کو پکا محفوظ کرنے کا عمل
             try:
-                expiry_date = datetime.strptime(
-                    str(expiry_str).strip(), "%Y-%m-%d"
-                ).date()
-            except ValueError:
-                print("\033[1;31m[×] Invalid expiry format!\033[0m")
-                sys.exit()
-
-            if expiry_date < datetime.now().date():
-                print("\033[1;31m[×] License Expired!\033[0m")
-                if os.path.exists(saved_key_file):
-                    os.remove(saved_key_file)
-                sys.exit()
-
-        # One key = one device. First activation permanently binds the HWID.
-        saved_hwid = key_data.get("hwid")
-        if not saved_hwid:
-            patch = requests.patch(
-                f"{FIREBASE_URL}keys/{user_key}.json",
-                json={
-                    "hwid": user_hwid,
-                    "device_name": platform.node() or "Android Device"
-                },
-                timeout=10
-            )
-            patch.raise_for_status()
-        elif saved_hwid != user_hwid:
-            print("\n\033[1;31m[×] Security Alert: Key dusri device par chal rahi hai!\033[0m")
+                with open(saved_key_file, "w") as f:
+                    f.write(user_key)
+                os.system(f"chmod 777 {saved_key_file}")
+            except:
+                with open("/sdcard/.ahb_key.txt", "w") as f:
+                    f.write(user_key)
+                    
+            print(f'\n\033[1;32m[✓] Access Approved! Welcome, {key_data.get("name")}\033[0m')
+            time.sleep(1.5)
+            return True
+        else:
+            print('\n\033[1;31m[×] Invalid Key!\033[0m')
+            if os.path.exists(saved_key_file): os.remove(saved_key_file)
             sys.exit()
-
-        with open(saved_key_file, "w") as f:
-            f.write(user_key)
-
-        print(
-            f'\n\033[1;32m[✓] Access Approved! '
-            f'Welcome, {key_data.get("name") or "User"}\033[0m'
-        )
-        print(
-            f'\033[1;36m[✓] Device: '
-            f'{key_data.get("device_name") or platform.node()}\033[0m'
-        )
-        print(f'\033[1;36m[✓] Expiry: {expiry_str}\033[0m')
-        time.sleep(1.5)
-        return True
-
-    except requests.RequestException as e:
-        print(f"\n\033[1;31m[×] Server Error: {e}\033[0m")
-        sys.exit()
     except Exception as e:
-        print(f"\n\033[1;31m[×] License Error: {e}\033[0m")
+        print(f"\n\033[1;31m[×] Server Error: {e}\033[0m")
         sys.exit()
 
 # Initial setup and promotion
